@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import platform
 from typing import cast
 
@@ -69,8 +70,12 @@ def get_cv2_backend() -> int:
     import cv2
 
     if platform.system() == "Windows":
-        return int(cv2.CAP_MSMF)
-        # return int(cv2.CAP_MSMF) if platform.release()==str(11) else int(cv2.CAP_DSHOW)
+        backend = os.environ.get("LEROBOT_OPENCV_BACKEND", "DSHOW").upper()
+        if backend == "MSMF":
+            return int(cv2.CAP_MSMF)
+        if backend == "ANY":
+            return int(cv2.CAP_ANY)
+        return int(cv2.CAP_DSHOW)
     # elif platform.system() == "Darwin":  # macOS
     #     return cv2.CAP_AVFOUNDATION
     else:  # Linux and others
