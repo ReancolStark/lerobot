@@ -185,6 +185,5 @@ datasets/
 *.pt
 
 # 忽略一些配置笔记
-custom/notes/指令总结.md
 custom/notes/本地指令总结.md
 custom/notes/记录.txt
