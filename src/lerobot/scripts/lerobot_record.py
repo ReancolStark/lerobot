@@ -192,6 +192,8 @@ class RecordConfig:
     policy: PreTrainedConfig | None = None
     # Display all cameras on screen
     display_data: bool = False
+    # Display policy YOLO debug overlays when display_data is enabled.
+    display_yolo_debug: bool = True
     # Use vocal synthesis to read events.
     play_sounds: bool = True
     # Resume recording on an existing dataset.
@@ -481,7 +483,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset: # 实际开始录制
         isinstance(policy.config, customACTConfig) and 
         (policy.config.use_segment_understanding or policy.config.use_mask_weight)):
         policy.set_preprocessor(preprocessor)
-        if cfg.display_data and hasattr(policy, "enable_debug_visualization"):
+        if cfg.display_data and cfg.display_yolo_debug and hasattr(policy, "enable_debug_visualization"):
             policy.enable_debug_visualization(True)
 
     robot.connect()

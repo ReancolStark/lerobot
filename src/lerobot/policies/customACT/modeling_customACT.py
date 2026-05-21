@@ -189,12 +189,21 @@ class ACTPolicy(PreTrainedPolicy):
         self.model.enable_debug_visualization = enable
         if not enable:
             self.model.latest_yolo_debug_overlays = {}
+            self.model.debug_yolo_overlay_ttl = {}
 
     def get_debug_observation_images(self) -> dict[str, np.ndarray]:
         overlays = getattr(self.model, "latest_yolo_debug_overlays", None)
         if not overlays:
             return {}
-        return overlays
+        output = dict(overlays)
+        ttl = getattr(self.model, "debug_yolo_overlay_ttl", None)
+        if ttl is not None:
+            for key in list(ttl):
+                ttl[key] -= 1
+                if ttl[key] <= 0:
+                    ttl.pop(key, None)
+                    overlays.pop(key, None)
+        return output
         
 
 class ACTTemporalEnsembler:
@@ -337,6 +346,8 @@ class ACT(nn.Module):
         self.config = config
         self.enable_debug_visualization = False
         self.latest_yolo_debug_overlays: dict[str, np.ndarray] = {}
+        self.debug_yolo_overlay_ttl: dict[str, int] = {}
+        self.debug_yolo_call_count = 0
 
         print('------customACT------') # customACT标记
 
@@ -484,7 +495,52 @@ class ACT(nn.Module):
         print(self.backbone)
         print("=====================================\n")
 
-        
+    @staticmethod
+    def _count_yolo_detections(yolo_results) -> int:
+        if yolo_results is None:
+            return 0
+        return sum(0 if result.boxes is None else len(result.boxes) for result in yolo_results)
+
+    def _record_yolo_debug_from_results(
+        self,
+        img_key: str,
+        imgs_for_yolo: Tensor,
+        yolo_results,
+        sources: tuple[str, ...],
+        overlay_interval: int = 1,
+        overlay_hold_frames: int = 8,
+    ) -> None:
+        """Record Rerun debug data from the exact YOLO result consumed by policy branches."""
+        if not self.enable_debug_visualization or yolo_results is None:
+            return
+
+        sources = tuple(dict.fromkeys(sources)) or ("yolo",)
+        self.debug_yolo_call_count += 1
+        cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
+        num_detections = self._count_yolo_detections(yolo_results)
+        for source in sources:
+            debug_prefix = f"custom.yolo_debug.{source}.{cam_name}"
+            self.latest_yolo_debug_overlays[f"{debug_prefix}.call_count"] = np.array(
+                self.debug_yolo_call_count,
+                dtype=np.float32,
+            )
+            self.latest_yolo_debug_overlays[f"{debug_prefix}.num_detections"] = np.array(
+                num_detections,
+                dtype=np.float32,
+            )
+
+        interval = max(1, int(overlay_interval))
+        if self.debug_yolo_call_count % interval != 0 or len(yolo_results) == 0:
+            return
+
+        overlay = self.yolo_data_processer.make_debug_overlay_chw(imgs_for_yolo[0], yolo_results[0])
+        hold_frames = max(1, int(overlay_hold_frames))
+        overlay_keys = [f"custom.yolo_overlay.{source}.{cam_name}" for source in sources]
+        overlay_keys.append(f"custom.yolo_overlay.{cam_name}")
+        for key in overlay_keys:
+            self.latest_yolo_debug_overlays[key] = overlay
+            self.debug_yolo_overlay_ttl[key] = hold_frames
+
 
     def _reset_parameters(self):
         """Xavier-uniform initialization of the transformer parameters as in the original code."""
@@ -596,6 +652,9 @@ class ACT(nn.Module):
             # print(f"encoder_in_tokens length after adding history_obs_state_embed: {len(encoder_in_tokens)}") # debug 输出添加历史观测状态embedding后encoder_in_tokens的长度:6
 
         # 新增：调用实例分割理解模块
+        yolo_results_by_img_key = {}
+        imgs_for_yolo_by_img_key = {}
+
         if self.config.use_segment_understanding:
             cam_key = f"observation.images.{self.config.seg_config.camera_name}"
 
@@ -605,7 +664,26 @@ class ACT(nn.Module):
             obs_state_rad = norm_step._apply_transform(batch[OBS_STATE], OBS_STATE, FeatureType.STATE, inverse=True) * (torch.pi / 180.0) # 1、反归一化 2、度转弧度
             
             # 传入YOLO和FK，并得到分割理解的embedding
-            yolo_r, yolo_mask = self.yolo_data_processer.get_yolo_data(imgs_for_yolo)
+            yolo_results = self.yolo_data_processer.get_yolo_results(imgs_for_yolo)
+            yolo_results_by_img_key[cam_key] = yolo_results
+            imgs_for_yolo_by_img_key[cam_key] = imgs_for_yolo
+            self._record_yolo_debug_from_results(
+                cam_key,
+                imgs_for_yolo,
+                yolo_results,
+                ("segment",),
+                overlay_interval=1,
+                overlay_hold_frames=8,
+            )
+
+            yolo_r_list = []
+            yolo_mask_list = []
+            for result in yolo_results:
+                yolo_r_i, yolo_mask_i = self.yolo_data_processer.process_single_result(result)
+                yolo_r_list.append(yolo_r_i)
+                yolo_mask_list.append(yolo_mask_i)
+            yolo_r = torch.stack(yolo_r_list, dim=0)
+            yolo_mask = torch.stack(yolo_mask_list, dim=0)
             ee_pose = self.kinematics.forward_kinematics_batch(obs_state_rad)
             segment_understanding_embed = self.segment_understanding_embedding(yolo_r, yolo_mask , ee_pose) #(B, D)
             # 最后把embedding放入tokens
@@ -624,29 +702,35 @@ class ACT(nn.Module):
                 cam_features = self.backbone(img)["feature_map"]    # [8, 3, 480, 640] -> [8, 512, 15, 20]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 yolo_mask = None
+                yolo_results = None
+                imgs_for_yolo = None
                 target_tokens = None
                 target_pos_embed = None
 
                 if self.config.use_mask_weight: # if部分是yolo_mask_weight的内容
                     # 提取mask
-                    norm_step:NormalizerProcessorStep = self.preprocessor.steps[3]
-                    imgs_for_yolo = norm_step._apply_transform(img, img_key, FeatureType.VISUAL, inverse=True)
-                    yolo_results = self.yolo_data_processer.get_yolo_results(imgs_for_yolo)
+                    if img_key in yolo_results_by_img_key:
+                        imgs_for_yolo = imgs_for_yolo_by_img_key[img_key]
+                        yolo_results = yolo_results_by_img_key[img_key]
+                    else:
+                        norm_step:NormalizerProcessorStep = self.preprocessor.steps[3]
+                        imgs_for_yolo = norm_step._apply_transform(img, img_key, FeatureType.VISUAL, inverse=True)
+                        yolo_results = self.yolo_data_processer.get_yolo_results(imgs_for_yolo)
+                        yolo_results_by_img_key[img_key] = yolo_results
+                        imgs_for_yolo_by_img_key[img_key] = imgs_for_yolo
+                    self._record_yolo_debug_from_results(
+                        img_key,
+                        imgs_for_yolo,
+                        yolo_results,
+                        ("mask_weight",),
+                        overlay_interval=1,
+                        overlay_hold_frames=8,
+                    )
                     yolo_mask = yolo_result_to_soft_mask(
                         yolo_results,
                         kernel_size=getattr(self.config.mw_config, "mask_blur_kernel_size", 7),
                         sigma=getattr(self.config.mw_config, "mask_blur_sigma", 2.0),
                     )
-
-                    # 显示出处理后的图片
-                    if (
-                        self.enable_debug_visualization
-                        and len(yolo_results) > 0
-                    ):
-                        cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
-                        self.latest_yolo_debug_overlays[f"custom.yolo_overlay.{cam_name}"] = (
-                            self.yolo_data_processer.make_debug_overlay_chw(imgs_for_yolo[0], yolo_results[0])
-                        )
 
                     # 处理mask形状
                     if self.mask_weight_mode == "legacy_multiply":
