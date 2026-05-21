@@ -110,11 +110,11 @@ class ACTConfig(PreTrainedConfig):
     # —————————————————————————————————————————————————————————————————————————————————————
 
     # Segment understanding config
-    use_segment_understanding: bool = False
+    use_segment_understanding: bool = True
     seg_config: SegmentUnderstandingConfig = field(default_factory=SegmentUnderstandingConfig)
 
     # YOLO mask
-    use_mask_weight: bool = True
+    use_mask_weight: bool = False
     mw_config:MaskWeightConfig = field(default_factory=MaskWeightConfig)
 
     # Input / output structure.
