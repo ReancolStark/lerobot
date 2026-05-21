@@ -189,12 +189,21 @@ class ACTPolicy(PreTrainedPolicy):
         self.model.enable_debug_visualization = enable
         if not enable:
             self.model.latest_yolo_debug_overlays = {}
+            self.model.debug_yolo_overlay_ttl = {}
 
     def get_debug_observation_images(self) -> dict[str, np.ndarray]:
         overlays = getattr(self.model, "latest_yolo_debug_overlays", None)
         if not overlays:
             return {}
-        return overlays
+        output = dict(overlays)
+        ttl = getattr(self.model, "debug_yolo_overlay_ttl", None)
+        if ttl is not None:
+            for key in list(ttl):
+                ttl[key] -= 1
+                if ttl[key] <= 0:
+                    ttl.pop(key, None)
+                    overlays.pop(key, None)
+        return output
         
 
 class ACTTemporalEnsembler:
@@ -337,6 +346,8 @@ class ACT(nn.Module):
         self.config = config
         self.enable_debug_visualization = False
         self.latest_yolo_debug_overlays: dict[str, np.ndarray] = {}
+        self.debug_yolo_overlay_ttl: dict[str, int] = {}
+        self.debug_yolo_call_count = 0
 
         print('------customACT------') # customACT标记
 
@@ -476,7 +487,52 @@ class ACT(nn.Module):
         print(self.backbone)
         print("=====================================\n")
 
-        
+    @staticmethod
+    def _count_yolo_detections(yolo_results) -> int:
+        if yolo_results is None:
+            return 0
+        return sum(0 if result.boxes is None else len(result.boxes) for result in yolo_results)
+
+    def _record_yolo_debug_from_results(
+        self,
+        img_key: str,
+        imgs_for_yolo: Tensor,
+        yolo_results,
+        sources: tuple[str, ...],
+        overlay_interval: int = 1,
+        overlay_hold_frames: int = 8,
+    ) -> None:
+        """Record Rerun debug data from the exact YOLO result consumed by policy branches."""
+        if not self.enable_debug_visualization or yolo_results is None:
+            return
+
+        sources = tuple(dict.fromkeys(sources)) or ("yolo",)
+        self.debug_yolo_call_count += 1
+        cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
+        num_detections = self._count_yolo_detections(yolo_results)
+        for source in sources:
+            debug_prefix = f"custom.yolo_debug.{source}.{cam_name}"
+            self.latest_yolo_debug_overlays[f"{debug_prefix}.call_count"] = np.array(
+                self.debug_yolo_call_count,
+                dtype=np.float32,
+            )
+            self.latest_yolo_debug_overlays[f"{debug_prefix}.num_detections"] = np.array(
+                num_detections,
+                dtype=np.float32,
+            )
+
+        interval = max(1, int(overlay_interval))
+        if self.debug_yolo_call_count % interval != 0 or len(yolo_results) == 0:
+            return
+
+        overlay = self.yolo_data_processer.make_debug_overlay_chw(imgs_for_yolo[0], yolo_results[0])
+        hold_frames = max(1, int(overlay_hold_frames))
+        overlay_keys = [f"custom.yolo_overlay.{source}.{cam_name}" for source in sources]
+        overlay_keys.append(f"custom.yolo_overlay.{cam_name}")
+        for key in overlay_keys:
+            self.latest_yolo_debug_overlays[key] = overlay
+            self.debug_yolo_overlay_ttl[key] = hold_frames
+
 
     def _reset_parameters(self):
         """Xavier-uniform initialization of the transformer parameters as in the original code."""
@@ -645,20 +701,23 @@ class ACT(nn.Module):
                         inverse=True,
                     )
                     yolo_results = self.yolo_data_processer.get_yolo_results(imgs_for_yolo)
+                    debug_sources = []
+                    if needs_segment_tokens:
+                        debug_sources.append("segment")
+                    if self.config.use_mask_weight:
+                        debug_sources.append("mask_weight")
+                    self._record_yolo_debug_from_results(
+                        img_key,
+                        imgs_for_yolo,
+                        yolo_results,
+                        tuple(debug_sources),
+                        overlay_interval=1,
+                        overlay_hold_frames=8,
+                    )
 
                 if self.config.use_mask_weight: # if部分是yolo_mask_weight的内容
                     # 提取mask
                     yolo_mask = yolo_result_to_soft_mask(yolo_results)
-
-                    # 显示出处理后的图片
-                    if (
-                        self.enable_debug_visualization
-                        and len(yolo_results) > 0
-                    ):
-                        cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
-                        self.latest_yolo_debug_overlays[f"custom.yolo_overlay.{cam_name}"] = (
-                            self.yolo_data_processer.make_debug_overlay_chw(imgs_for_yolo[0], yolo_results[0])
-                        )
 
                     # 处理mask形状
                     target_h, target_w = cam_features.shape[-2:]
