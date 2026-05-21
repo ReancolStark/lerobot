@@ -66,6 +66,9 @@ class RecoveryAdaptiveChunkingConfig:
     max_old_action_weight: float = 0.9
     transition_blend_steps: int = 3
     transition_blend_old_action_weight: float = 0.5
+    action_continuity_guard: bool = True
+    action_step_guard_mad_scale: float = 3.0
+    action_step_guard_min_norm: float = 0.0
     debug_print_chunks: bool = True
     debug_print_every: int = 1
     debug_print_num_actions: int = 3
@@ -132,6 +135,9 @@ class RecoveryAdaptiveChunkingConfig:
                 "max_old_action_weight",
                 "transition_blend_steps",
                 "transition_blend_old_action_weight",
+                "action_continuity_guard",
+                "action_step_guard_mad_scale",
+                "action_step_guard_min_norm",
                 "debug_print_chunks",
                 "debug_print_every",
                 "debug_print_num_actions",
@@ -199,6 +205,10 @@ class RecoveryAdaptiveChunkingConfig:
                 raise ValueError(
                     "`adaptive_action_chunking.transition_blend_old_action_weight` must be between 0 and 1."
                 )
+            if self.action_step_guard_mad_scale < 0:
+                raise ValueError("`adaptive_action_chunking.action_step_guard_mad_scale` cannot be negative.")
+            if self.action_step_guard_min_norm < 0:
+                raise ValueError("`adaptive_action_chunking.action_step_guard_min_norm` cannot be negative.")
             if self.debug_print_every <= 0:
                 raise ValueError("`adaptive_action_chunking.debug_print_every` must be positive.")
             if self.debug_print_num_actions < 0 or self.debug_print_action_dims < 0:

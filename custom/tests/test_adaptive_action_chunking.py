@@ -148,8 +148,34 @@ def test_adaptive_temporal_ensemble_returns_next_action():
     assert torch.allclose(second_action, torch.full((1, 3), 0.75))
 
 
+def test_continuity_guard_clips_outlier_action_jump():
+    cfg = AdaptiveActionChunkingConfig(
+        min_chunk_size=2,
+        max_chunk_size=4,
+        transition_blend_steps=0,
+        action_continuity_guard=True,
+        action_step_guard_mad_scale=0.0,
+    )
+    controller = AdaptiveActionChunkingController(
+        cfg,
+        policy_chunk_size=4,
+        policy_n_action_steps=4,
+    )
+    controller.observe_executed_action(torch.zeros(1, 1))
+
+    actions = torch.tensor([[[0.0], [0.1], [4.0], [4.1]]])
+    guarded = controller.smooth_chunk_transition(actions)
+    first_delta = torch.abs(guarded[:, 0] - torch.zeros(1, 1))
+    inner_delta = torch.abs(guarded[:, 1:] - guarded[:, :-1])
+
+    assert torch.max(first_delta) <= 0.1001
+    assert torch.max(inner_delta) <= 0.1001
+    assert guarded[0, 2, 0] < 1.0
+
+
 if __name__ == "__main__":
     test_adaptive_chunking_stretches_stable_history()
     test_adaptive_chunking_shortens_unstable_history()
     test_adaptive_temporal_ensemble_returns_next_action()
+    test_continuity_guard_clips_outlier_action_jump()
     print("Adaptive action chunking tests passed.")

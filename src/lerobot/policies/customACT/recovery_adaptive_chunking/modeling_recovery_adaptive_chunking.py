@@ -388,6 +388,9 @@ class RecoveryAdaptiveChunkingController:
         self.execution_count = 0
         self.current_chunk_size = 0
         self.current_chunk_step = 0
+        self.latest_guard_limit: float | None = None
+        self.latest_pre_guard_max_step: float | None = None
+        self.latest_post_guard_max_step: float | None = None
 
     def reset(self) -> None:
         self.state_history.clear()
@@ -399,6 +402,9 @@ class RecoveryAdaptiveChunkingController:
         self.execution_count = 0
         self.current_chunk_size = 0
         self.current_chunk_step = 0
+        self.latest_guard_limit = None
+        self.latest_pre_guard_max_step = None
+        self.latest_post_guard_max_step = None
 
     def observe_state(self, state: Tensor | None) -> None:
         if state is None:
@@ -503,23 +509,94 @@ class RecoveryAdaptiveChunkingController:
 
     def smooth_chunk_transition(self, actions: Tensor) -> Tensor:
         """Blend the first few actions of a new queued chunk with the last executed action."""
-        if self.last_executed_action is None or actions.ndim != 3 or actions.shape[1] == 0:
+        if actions.ndim != 3 or actions.shape[1] == 0:
             return actions
+
+        smoothed = actions
+        if self.last_executed_action is None:
+            return self._apply_action_continuity_guard(smoothed)
 
         blend_steps = min(max(0, self.config.transition_blend_steps), actions.shape[1])
         old_weight_max = min(max(self.config.transition_blend_old_action_weight, 0.0), 1.0)
         if blend_steps == 0 or old_weight_max <= 0:
-            return actions
+            return self._apply_action_continuity_guard(smoothed)
 
         last_action = self.last_executed_action.to(device=actions.device, dtype=actions.dtype).view(1, -1)
         if last_action.shape[-1] != actions.shape[-1]:
-            return actions
+            return self._apply_action_continuity_guard(smoothed)
 
         smoothed = actions.clone()
         for step in range(blend_steps):
             old_weight = old_weight_max * (1.0 - step / blend_steps)
             smoothed[:, step] = old_weight * last_action + (1.0 - old_weight) * smoothed[:, step]
-        return smoothed
+        return self._apply_action_continuity_guard(smoothed)
+
+    def _apply_action_continuity_guard(self, actions: Tensor) -> Tensor:
+        """Limit large action jumps inside the selected execution prefix.
+
+        Adaptive chunking can shorten the task by executing more decisive action
+        prefixes, but the touch-task analysis showed that this may slightly raise
+        the mean per-frame joint step. This guard keeps the controller's
+        efficiency benefit while clipping only deltas that are outliers relative
+        to the current predicted chunk.
+        """
+        if (
+            not self.config.action_continuity_guard
+            or actions.ndim != 3
+            or actions.shape[1] == 0
+        ):
+            self.latest_guard_limit = None
+            self.latest_pre_guard_max_step = None
+            self.latest_post_guard_max_step = None
+            return actions
+
+        if self.last_executed_action is not None:
+            reference = self.last_executed_action.to(device=actions.device, dtype=actions.dtype).view(1, -1)
+            if reference.shape[-1] != actions.shape[-1]:
+                reference = actions[:, 0].detach()
+        else:
+            reference = actions[:, 0].detach()
+        if reference.shape[0] != actions.shape[0]:
+            reference = reference.expand(actions.shape[0], -1)
+
+        sequence = torch.cat([reference.unsqueeze(1), actions], dim=1)
+        deltas = sequence[:, 1:] - sequence[:, :-1]
+        step_norm = _rms(deltas).detach().flatten()
+        if step_norm.numel() == 0:
+            self.latest_guard_limit = None
+            self.latest_pre_guard_max_step = None
+            self.latest_post_guard_max_step = None
+            return actions
+        self.latest_pre_guard_max_step = float(step_norm.max().item())
+
+        median = step_norm.median()
+        mad = (step_norm - median).abs().median()
+        limit = median + self.config.action_step_guard_mad_scale * mad
+        min_norm = torch.as_tensor(
+            self.config.action_step_guard_min_norm,
+            dtype=actions.dtype,
+            device=actions.device,
+        )
+        limit = torch.maximum(limit.to(device=actions.device, dtype=actions.dtype), min_norm)
+        if float(limit.item()) <= 0.0:
+            self.latest_guard_limit = None
+            self.latest_post_guard_max_step = self.latest_pre_guard_max_step
+            return actions
+        self.latest_guard_limit = float(limit.item())
+
+        guarded = actions.clone()
+        prev = reference
+        eps = torch.finfo(actions.dtype).eps
+        for step in range(actions.shape[1]):
+            delta = guarded[:, step] - prev
+            norm = _rms(delta).unsqueeze(-1).clamp_min(eps)
+            scale = torch.clamp(limit / norm, max=1.0)
+            guarded[:, step] = prev + delta * scale
+            prev = guarded[:, step]
+        guarded_sequence = torch.cat([reference.unsqueeze(1), guarded], dim=1)
+        guarded_deltas = guarded_sequence[:, 1:] - guarded_sequence[:, :-1]
+        self.latest_post_guard_max_step = float(_rms(guarded_deltas).detach().max().item())
+        return guarded
 
     def debug_prediction(
         self,
@@ -551,6 +628,11 @@ class RecoveryAdaptiveChunkingController:
                 f"state_v={decision.state_volatility:.4f} state_a={decision.state_acceleration:.4f} "
                 f"act_u={decision.action_uncertainty:.4f} recovery={recovery}"
             )
+            if self.latest_guard_limit is not None:
+                metrics += (
+                    f" guard_limit={self.latest_guard_limit:.4f} "
+                    f"step_max={self.latest_pre_guard_max_step:.4f}->{self.latest_post_guard_max_step:.4f}"
+                )
 
         print(
             f"[RAC][predict #{self.prediction_count}][{source}] "
