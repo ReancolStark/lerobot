@@ -68,7 +68,7 @@ class SegmentUnderstandingEmbedding(nn.Module):
         fk: torch.Tensor,
         visual_features: torch.Tensor,
         object_visual_masks: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         object_features = object_features.to(device=visual_features.device, dtype=visual_features.dtype)
         object_mask = object_mask.to(device=visual_features.device)
         fk = fk.to(device=visual_features.device, dtype=visual_features.dtype)
@@ -119,7 +119,7 @@ class SegmentUnderstandingEmbedding(nn.Module):
             ],
             dim=1,
         )
-        return tokens, valid_mask
+        return tokens, valid_mask, target_token
 
 
 class ObjectTokenEncoder(nn.Module):
@@ -137,6 +137,13 @@ class ObjectTokenEncoder(nn.Module):
             nn.LayerNorm(config.output_dim),
             nn.Linear(config.output_dim, config.object_hidden_dim),
             nn.GELU(),
+        )
+        self.reliability_gate = nn.Sequential(
+            nn.LayerNorm(config.r_hidden_dim + config.object_hidden_dim),
+            nn.Linear(config.r_hidden_dim + config.object_hidden_dim, config.reliability_hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.reliability_hidden_dim, 1),
+            nn.Sigmoid(),
         )
         self.token_proj = nn.Sequential(
             nn.LayerNorm(config.cls_embed_dim + config.r_hidden_dim + config.object_hidden_dim),
@@ -160,8 +167,10 @@ class ObjectTokenEncoder(nn.Module):
         cls_embed = self.cls_embed(cls_ids)
         numeric_embed = self.numeric_encoder(numeric)
         visual_embed = self.visual_encoder(object_visual)
+        reliability = self.reliability_gate(torch.cat([numeric_embed, visual_embed], dim=-1))
 
         tokens = self.token_proj(torch.cat([cls_embed, numeric_embed, visual_embed], dim=-1))
+        tokens = tokens * (0.1 + 0.9 * reliability)
         return tokens.masked_fill(~object_mask.unsqueeze(-1), 0.0)
 
 

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import json
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -123,6 +124,28 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
     return train_metrics, output_dict
+
+
+def append_customact_v3_train_log(log_path, step: int, train_tracker: MetricsTracker, output_dict: dict) -> None:
+    """Append V3 segment/servo metrics to a small JSONL file for post-run inspection."""
+    if not output_dict or not any(key.startswith("servo_") for key in output_dict):
+        return
+
+    current_metrics = train_tracker.to_dict(use_avg=False)
+    record = {
+        "step": step,
+        "samples": current_metrics["samples"],
+        "epochs": current_metrics["epochs"],
+        "loss": current_metrics["loss"],
+        "grad_norm": current_metrics["grad_norm"],
+        "lr": current_metrics["lr"],
+    }
+    for key in ("l1_loss", "kld_loss", "servo_aux_loss", "servo_action_abs"):
+        if key in output_dict:
+            record[key] = float(output_dict[key])
+
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 @parser.wrap() # 通过这个@把参数传递给cfg
@@ -274,6 +297,32 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    customact_v3_train_log_path = None
+    if (
+        is_main_process
+        and isinstance(cfg.policy, customACTConfig)
+        and cfg.policy.use_segment_understanding
+        and cfg.policy.seg_config.use_servo_residual
+    ):
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        customact_v3_train_log_path = cfg.output_dir / "customact_v3_train_log.jsonl"
+        with customact_v3_train_log_path.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "event": "customact_v3_train_log_start",
+                        "resume": cfg.resume,
+                        "start_step": step,
+                        "servo_residual_scale": cfg.policy.seg_config.servo_residual_scale,
+                        "servo_aux_loss_weight": cfg.policy.seg_config.servo_aux_loss_weight,
+                        "servo_target_horizon": cfg.policy.seg_config.servo_target_horizon,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+        logging.info(f"CustomACT V3 train log: {customact_v3_train_log_path}")
+
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
@@ -355,6 +404,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         # increment `step` here.
         step += 1
         train_tracker.step()
+        if customact_v3_train_log_path is not None:
+            append_customact_v3_train_log(customact_v3_train_log_path, step, train_tracker, output_dict)
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0

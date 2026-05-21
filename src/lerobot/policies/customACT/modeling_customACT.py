@@ -179,6 +179,30 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
+        servo_action = getattr(self.model, "latest_servo_action", None)
+        servo_aux_weight = (
+            float(self.config.seg_config.servo_aux_loss_weight)
+            if self.config.use_segment_understanding and self.config.seg_config.use_servo_residual
+            else 0.0
+        )
+        if servo_action is not None and servo_aux_weight > 0.0:
+            horizon = min(
+                int(self.config.seg_config.servo_target_horizon),
+                servo_action.shape[1],
+                batch[ACTION].shape[1],
+            )
+            servo_target = batch[ACTION][:, :horizon]
+            servo_pred = servo_action[:, :horizon]
+            servo_valid = (~batch["action_is_pad"][:, :horizon]).unsqueeze(-1)
+            servo_loss_raw = F.l1_loss(servo_target, servo_pred, reduction="none") * servo_valid
+            servo_denom = (
+                servo_valid.sum().to(dtype=servo_loss_raw.dtype) * servo_loss_raw.shape[-1]
+            ).clamp(min=1.0)
+            servo_aux_loss = servo_loss_raw.sum() / servo_denom
+            loss = loss + servo_aux_weight * servo_aux_loss
+            loss_dict["servo_aux_loss"] = servo_aux_loss.item()
+            loss_dict["servo_action_abs"] = servo_action.detach().abs().mean().item()
+
         return loss, loss_dict
 
     # 专门给yolo和fk用的预处理器设置函数，它们需要没有经过归一化的数据，然而lerobot传入的batch已经经过归一化了
@@ -297,6 +321,30 @@ class ACTTemporalEnsembler:
         return action
 
 
+class SegmentServoResidualHead(nn.Module):
+    """Predict a short-horizon action proposal from the segment/FK target token."""
+
+    def __init__(self, config: ACTConfig):
+        super().__init__()
+        self.chunk_size = config.chunk_size
+        self.time_embed = nn.Embedding(config.chunk_size, config.dim_model)
+        self.net = nn.Sequential(
+            nn.LayerNorm(config.dim_model * 2),
+            nn.Linear(config.dim_model * 2, config.seg_config.servo_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.seg_config.fusion_dropout),
+            nn.Linear(config.seg_config.servo_hidden_dim, config.seg_config.servo_hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.seg_config.servo_hidden_dim, config.action_feature.shape[0]),
+        )
+
+    def forward(self, segment_context: Tensor) -> Tensor:
+        batch_size = segment_context.shape[0]
+        context = segment_context.unsqueeze(1).expand(batch_size, self.chunk_size, -1)
+        time_embed = self.time_embed.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        return self.net(torch.cat([context, time_embed], dim=-1))
+
+
 class ACT(nn.Module):
     """Action Chunking Transformer: The underlying neural network for ACTPolicy.
 
@@ -348,6 +396,7 @@ class ACT(nn.Module):
         self.latest_yolo_debug_overlays: dict[str, np.ndarray] = {}
         self.debug_yolo_overlay_ttl: dict[str, int] = {}
         self.debug_yolo_call_count = 0
+        self.latest_servo_action: Tensor | None = None
 
         print('------customACT------') # customACT标记
 
@@ -477,6 +526,9 @@ class ACT(nn.Module):
 
         # Final action regression head on the output of the transformer's decoder.
         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+        self.segment_servo_head = None
+        if self.config.use_segment_understanding and self.config.seg_config.use_servo_residual:
+            self.segment_servo_head = SegmentServoResidualHead(config)
 
         self._reset_parameters()
 
@@ -567,6 +619,7 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        self.latest_servo_action = None
         if self.enable_debug_visualization:
             self.latest_yolo_debug_overlays = {}
 
@@ -660,6 +713,7 @@ class ACT(nn.Module):
 
         segment_tokens = None
         segment_valid_mask = None
+        segment_context = None
         segment_camera_key = f"{OBS_IMAGES}.{self.config.seg_config.camera_name}"
         ee_pose = None
         norm_step: NormalizerProcessorStep | None = None
@@ -700,7 +754,10 @@ class ACT(nn.Module):
                         FeatureType.VISUAL,
                         inverse=True,
                     )
-                    yolo_results = self.yolo_data_processer.get_yolo_results(imgs_for_yolo)
+                    yolo_results = self.yolo_data_processer.get_yolo_results(
+                        imgs_for_yolo,
+                        use_tracking=not self.training and ACTION not in batch,
+                    )
                     debug_sources = []
                     if needs_segment_tokens:
                         debug_sources.append("segment")
@@ -750,7 +807,7 @@ class ACT(nn.Module):
                         yolo_results,
                         mask_size=(feature_h, feature_w),
                     )
-                    segment_tokens, segment_valid_mask = self.segment_understanding_embedding(
+                    segment_tokens, segment_valid_mask, segment_context = self.segment_understanding_embedding(
                         yolo_r,
                         yolo_mask,
                         ee_pose,
@@ -816,6 +873,10 @@ class ACT(nn.Module):
         decoder_out = decoder_out.transpose(0, 1)
 
         actions = self.action_head(decoder_out)
+        if self.segment_servo_head is not None and segment_context is not None:
+            servo_action = self.segment_servo_head(segment_context)
+            self.latest_servo_action = servo_action
+            actions = actions + float(self.config.seg_config.servo_residual_scale) * servo_action
 
         return actions, (mu, log_sigma_x2)
 

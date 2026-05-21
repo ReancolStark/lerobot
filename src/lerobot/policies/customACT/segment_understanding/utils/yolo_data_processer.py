@@ -16,17 +16,22 @@ class YoloDataProcessor:
         self.max_objects = config.max_yolo_objects
         self.yolo = YOLO(config.yolo_path)
         self.ee_anchor = torch.tensor(config.ee_anchor, dtype=torch.float32, device=device)
+        self.track_memory: dict[int, dict[str, object]] = {}
+        self.track_step = 0
 
     @torch.no_grad()
-    def get_yolo_results(self, frames):
-        # results = self.yolo.track(
-        #     source=frames,
-        #     persist=True,
-        #     verbose=False,
-        #     conf=0.25,
-        #     iou=0.7,
-        #     tracker=self.config.tracker_path,
-        # )
+    def get_yolo_results(self, frames, use_tracking: bool = False):
+        if use_tracking and self.config.use_tracking_in_eval:
+            return self.yolo.track(
+                source=frames,
+                persist=True,
+                verbose=False,
+                conf=0.25,
+                iou=0.7,
+                tracker=self.config.tracker_path,
+                device=self.device,
+            )
+
         return self.yolo.predict(
             source=frames,
             verbose=False,
@@ -104,8 +109,14 @@ class YoloDataProcessor:
         cos_theta = torch.cos(theta)
 
         mask_area_norm = self._get_mask_area_norm(result, xywhn, device)
+        bbox_area = (width * height).clamp(min=1e-6)
+        mask_bbox_ratio = (mask_area_norm / bbox_area).clamp(0.0, 1.5)
+        ee_anchor_iou = self._get_anchor_iou(xyxyn, device)
+        max_peer_iou = self._get_max_peer_iou(xyxyn)
+        track_age_bonus, track_center_jump = self._get_track_scores(result, obj_xy, device)
 
-        # [cls, cx, cy, w, h, aspect, dx, dy, dist, sin, cos, conf, area]
+        # [cls, cx, cy, w, h, aspect, dx, dy, dist, sin, cos, conf, area,
+        #  mask_bbox_ratio, ee_anchor_iou, max_peer_iou]
         raw = torch.stack(
             [
                 cls,
@@ -121,6 +132,9 @@ class YoloDataProcessor:
                 cos_theta,
                 conf,
                 mask_area_norm,
+                mask_bbox_ratio,
+                ee_anchor_iou,
+                max_peer_iou,
             ],
             dim=1,
         )
@@ -129,6 +143,9 @@ class YoloDataProcessor:
             conf
             - float(self.config.anchor_distance_weight) * dist
             + float(self.config.anchor_area_weight) * mask_area_norm
+            - float(self.config.overlap_ambiguity_weight) * max_peer_iou
+            + float(self.config.track_age_weight) * track_age_bonus
+            - float(self.config.track_jump_weight) * track_center_jump
         )
         order = torch.argsort(relevance, descending=True)
         raw = raw[order]
@@ -143,6 +160,105 @@ class YoloDataProcessor:
             feature_masks[:n_objects] = masks[:n_objects]
 
         return features, valid_mask, feature_masks
+
+    def _get_track_scores(
+        self,
+        result,
+        obj_xy: torch.Tensor,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        boxes = result.boxes
+        if boxes is None or boxes.id is None:
+            return (
+                torch.zeros(obj_xy.shape[0], dtype=torch.float32, device=device),
+                torch.zeros(obj_xy.shape[0], dtype=torch.float32, device=device),
+            )
+
+        self.track_step = getattr(self, "track_step", 0) + 1
+        memory = getattr(self, "track_memory", {})
+        track_ids = boxes.id.to(device=device, dtype=torch.int64)
+        age_bonus = torch.zeros(obj_xy.shape[0], dtype=torch.float32, device=device)
+        center_jump = torch.zeros(obj_xy.shape[0], dtype=torch.float32, device=device)
+
+        for i, track_id_tensor in enumerate(track_ids):
+            track_id = int(track_id_tensor.item())
+            center = obj_xy[i].detach()
+            previous = memory.get(track_id)
+            if previous is None:
+                age = 1
+                jump = 0.0
+            else:
+                age = int(previous["age"]) + 1
+                prev_center = previous["center"].to(device=device)
+                jump = float(torch.norm(center - prev_center).item())
+
+            age_bonus[i] = min(age / 10.0, 1.0)
+            center_jump[i] = min(jump, 1.0)
+            memory[track_id] = {
+                "center": center.detach().to("cpu"),
+                "age": age,
+                "last_seen": self.track_step,
+            }
+
+        max_age = int(self.config.track_memory_max_age)
+        stale_ids = [
+            track_id
+            for track_id, state in memory.items()
+            if self.track_step - int(state["last_seen"]) > max_age
+        ]
+        for track_id in stale_ids:
+            memory.pop(track_id, None)
+        self.track_memory = memory
+
+        return age_bonus, center_jump
+
+    def _get_anchor_iou(self, xyxyn: torch.Tensor, device: torch.device) -> torch.Tensor:
+        anchor = self.ee_anchor.to(device=device, dtype=torch.float32)
+        box_size = torch.tensor(self.config.ee_anchor_box_size, dtype=torch.float32, device=device)
+        half_size = box_size / 2.0
+        anchor_box = torch.stack(
+            [
+                (anchor[0] - half_size[0]).clamp(0.0, 1.0),
+                (anchor[1] - half_size[1]).clamp(0.0, 1.0),
+                (anchor[0] + half_size[0]).clamp(0.0, 1.0),
+                (anchor[1] + half_size[1]).clamp(0.0, 1.0),
+            ]
+        )
+
+        inter_x1 = torch.maximum(xyxyn[:, 0], anchor_box[0])
+        inter_y1 = torch.maximum(xyxyn[:, 1], anchor_box[1])
+        inter_x2 = torch.minimum(xyxyn[:, 2], anchor_box[2])
+        inter_y2 = torch.minimum(xyxyn[:, 3], anchor_box[3])
+        inter = (inter_x2 - inter_x1).clamp(min=0.0) * (inter_y2 - inter_y1).clamp(min=0.0)
+
+        box_area = (xyxyn[:, 2] - xyxyn[:, 0]).clamp(min=0.0) * (
+            xyxyn[:, 3] - xyxyn[:, 1]
+        ).clamp(min=0.0)
+        anchor_area = (anchor_box[2] - anchor_box[0]).clamp(min=0.0) * (
+            anchor_box[3] - anchor_box[1]
+        ).clamp(min=0.0)
+        union = (box_area + anchor_area - inter).clamp(min=1e-6)
+        return (inter / union).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _get_max_peer_iou(xyxyn: torch.Tensor) -> torch.Tensor:
+        n_boxes = xyxyn.shape[0]
+        if n_boxes <= 1:
+            return torch.zeros(n_boxes, dtype=xyxyn.dtype, device=xyxyn.device)
+
+        x1 = torch.maximum(xyxyn[:, None, 0], xyxyn[None, :, 0])
+        y1 = torch.maximum(xyxyn[:, None, 1], xyxyn[None, :, 1])
+        x2 = torch.minimum(xyxyn[:, None, 2], xyxyn[None, :, 2])
+        y2 = torch.minimum(xyxyn[:, None, 3], xyxyn[None, :, 3])
+        inter = (x2 - x1).clamp(min=0.0) * (y2 - y1).clamp(min=0.0)
+
+        area = (xyxyn[:, 2] - xyxyn[:, 0]).clamp(min=0.0) * (
+            xyxyn[:, 3] - xyxyn[:, 1]
+        ).clamp(min=0.0)
+        union = (area[:, None] + area[None, :] - inter).clamp(min=1e-6)
+        iou = inter / union
+        iou.fill_diagonal_(0.0)
+        return iou.max(dim=1).values.clamp(0.0, 1.0)
 
     def _get_mask_area_norm(self, result, xywhn: torch.Tensor, device: torch.device) -> torch.Tensor:
         if result.masks is None or len(result.masks.data) == 0:
