@@ -179,6 +179,10 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
+        mask_weight_debug = getattr(self.model, "latest_mask_weight_debug", None)
+        if mask_weight_debug:
+            loss_dict.update(mask_weight_debug)
+
         return loss, loss_dict
 
     # 专门给yolo和fk用的预处理器设置函数，它们需要没有经过归一化的数据，然而lerobot传入的batch已经经过归一化了
@@ -193,9 +197,14 @@ class ACTPolicy(PreTrainedPolicy):
 
     def get_debug_observation_images(self) -> dict[str, np.ndarray]:
         overlays = getattr(self.model, "latest_yolo_debug_overlays", None)
-        if not overlays:
+        mask_weight_debug = getattr(self.model, "latest_mask_weight_debug", None)
+        if not overlays and not mask_weight_debug:
             return {}
-        output = dict(overlays)
+        output = dict(overlays) if overlays else {}
+        if mask_weight_debug:
+            for key, value in mask_weight_debug.items():
+                if isinstance(value, (int, float, bool)):
+                    output[f"custom.{key.replace('/', '.')}"] = np.array(value, dtype=np.float32)
         ttl = getattr(self.model, "debug_yolo_overlay_ttl", None)
         if ttl is not None:
             for key in list(ttl):
@@ -348,6 +357,7 @@ class ACT(nn.Module):
         self.latest_yolo_debug_overlays: dict[str, np.ndarray] = {}
         self.debug_yolo_overlay_ttl: dict[str, int] = {}
         self.debug_yolo_call_count = 0
+        self.latest_mask_weight_debug: dict[str, float | str | bool] = {}
 
         print('------customACT------') # customACT标记
 
@@ -577,6 +587,7 @@ class ACT(nn.Module):
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
         if self.enable_debug_visualization:
             self.latest_yolo_debug_overlays = {}
+        self.latest_mask_weight_debug = {}
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -707,8 +718,7 @@ class ACT(nn.Module):
                 target_tokens = None
                 target_pos_embed = None
 
-                if self.config.use_mask_weight: # if部分是yolo_mask_weight的内容
-                    # 提取mask
+                if self.config.use_mask_weight:
                     if img_key in yolo_results_by_img_key:
                         imgs_for_yolo = imgs_for_yolo_by_img_key[img_key]
                         yolo_results = yolo_results_by_img_key[img_key]
@@ -730,6 +740,20 @@ class ACT(nn.Module):
                         yolo_results,
                         kernel_size=getattr(self.config.mw_config, "mask_blur_kernel_size", 7),
                         sigma=getattr(self.config.mw_config, "mask_blur_sigma", 2.0),
+                    )
+                    cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
+                    mask_for_debug = yolo_mask.detach()
+                    self.latest_mask_weight_debug[f"mask_weight/{cam_name}/detections"] = float(
+                        self._count_yolo_detections(yolo_results)
+                    )
+                    self.latest_mask_weight_debug[f"mask_weight/{cam_name}/mask_mean"] = float(
+                        mask_for_debug.mean().item()
+                    )
+                    self.latest_mask_weight_debug[f"mask_weight/{cam_name}/mask_max"] = float(
+                        mask_for_debug.max().item()
+                    )
+                    self.latest_mask_weight_debug[f"mask_weight/{cam_name}/mask_coverage"] = float(
+                        (mask_for_debug > 0.05).float().mean().item()
                     )
 
                     # 处理mask形状
@@ -772,6 +796,21 @@ class ACT(nn.Module):
                         cam_features,
                         mask_resized,
                     )
+                    cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
+                    gate_scale = getattr(self.mask_guided_visual_adapter, "gate_scale", None)
+                    if gate_scale is not None:
+                        self.latest_mask_weight_debug[f"mask_weight/{cam_name}/gate_scale"] = float(
+                            gate_scale.detach().item()
+                        )
+                    adapter_debug = getattr(self.mask_guided_visual_adapter, "latest_debug", {})
+                    for debug_name, debug_value in adapter_debug.items():
+                        self.latest_mask_weight_debug[
+                            f"mask_weight/{cam_name}/adapter_{debug_name}"
+                        ] = float(debug_value)
+                    if target_tokens is not None:
+                        self.latest_mask_weight_debug[f"mask_weight/{cam_name}/target_tokens"] = float(
+                            target_tokens.shape[0]
+                        )
 
 
                 # 重新排列features形状

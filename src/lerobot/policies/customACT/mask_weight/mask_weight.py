@@ -94,6 +94,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         super().__init__()
         self.config = config
         self.dim_model = dim_model
+        self.latest_debug: dict[str, float] = {}
 
         hidden_dim = int(config.adapter_hidden_dim)
         if config.use_spatial_embedding:
@@ -196,11 +197,15 @@ class MaskGuidedVisualAdapter(nn.Module):
         guidance = torch.cat([target_mask, context_mask, background_mask, confidence_map], dim=1)
 
         guided_features = visual_features
+        spatial_delta = None
         if self.mask_encoder is not None:
-            guided_features = guided_features + self.mask_encoder(guidance)
+            spatial_delta = self.mask_encoder(guidance)
+            guided_features = guided_features + spatial_delta
 
+        residual_delta = None
         if self.feature_adapter is not None:
-            guided_features = guided_features + self.gate_scale * target_mask * self.feature_adapter(visual_features)
+            residual_delta = self.gate_scale * target_mask * self.feature_adapter(visual_features)
+            guided_features = guided_features + residual_delta
 
         target_tokens, target_pos_embed = self._make_target_tokens(
             guided_features,
@@ -208,4 +213,30 @@ class MaskGuidedVisualAdapter(nn.Module):
             context_mask,
             background_mask,
         )
+        with torch.no_grad():
+            visual_rms = visual_features.detach().float().pow(2).mean().sqrt().clamp(min=1e-6)
+            output_delta = guided_features.detach() - visual_features.detach()
+            output_delta_rms = output_delta.float().pow(2).mean().sqrt()
+            spatial_delta_rms = (
+                torch.zeros((), device=visual_features.device)
+                if spatial_delta is None
+                else spatial_delta.detach().float().pow(2).mean().sqrt()
+            )
+            residual_delta_rms = (
+                torch.zeros((), device=visual_features.device)
+                if residual_delta is None
+                else residual_delta.detach().float().pow(2).mean().sqrt()
+            )
+            self.latest_debug = {
+                "visual_rms": float(visual_rms.item()),
+                "spatial_delta_rms": float(spatial_delta_rms.item()),
+                "spatial_delta_ratio": float((spatial_delta_rms / visual_rms).item()),
+                "residual_delta_rms": float(residual_delta_rms.item()),
+                "residual_delta_ratio": float((residual_delta_rms / visual_rms).item()),
+                "output_delta_rms": float(output_delta_rms.item()),
+                "output_delta_ratio": float((output_delta_rms / visual_rms).item()),
+                "target_mask_mean": float(target_mask.detach().float().mean().item()),
+                "context_mask_mean": float(context_mask.detach().float().mean().item()),
+                "background_mask_mean": float(background_mask.detach().float().mean().item()),
+            }
         return guided_features, target_tokens, target_pos_embed

@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import json
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -52,6 +53,103 @@ from lerobot.utils.utils import (
 )
 from lerobot.policies.customACT.modeling_customACT import ACTPolicy as customACT
 from lerobot.policies.customACT.modeling_customACT import ACTConfig as customACTConfig
+
+
+def _json_safe(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return value.detach().cpu().item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _write_customact_mask_weight_config(output_dir, policy: PreTrainedPolicy) -> None:
+    if not isinstance(policy, customACT) or not isinstance(policy.config, customACTConfig):
+        return
+    if not policy.config.use_mask_weight:
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    mw_config = policy.config.mw_config
+    config_payload = {
+        "policy_type": getattr(policy.config, "type", "customACT"),
+        "use_mask_weight": policy.config.use_mask_weight,
+        "use_segment_understanding": policy.config.use_segment_understanding,
+        "use_yolo": policy.config.use_yolo,
+        "vision_backbone": policy.config.vision_backbone,
+        "mask_weight": _json_safe(vars(mw_config)),
+        "tested_path": (
+            "Mask-Guided Visual Adapter + optional target tokens"
+            if mw_config.mode == "adapter"
+            else "Legacy fixed hard multiply"
+        ),
+    }
+    with open(output_dir / "mask_weight_config.json", "w", encoding="utf-8") as f:
+        json.dump(config_payload, f, indent=2, ensure_ascii=False)
+
+
+def _append_mask_weight_debug_log(output_dir, step: int, output_dict: dict | None) -> None:
+    if not output_dict:
+        return
+    debug_dict = {
+        key: value
+        for key, value in output_dict.items()
+        if key.startswith("mask_weight/") or key in {"l1_loss", "kld_loss"}
+    }
+    if not any(key.startswith("mask_weight/") for key in debug_dict):
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    record = {"step": step, **_json_safe(debug_dict)}
+    with open(output_dir / "mask_weight_debug.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _collect_mask_weight_grad_debug(policy: PreTrainedPolicy) -> dict[str, float]:
+    if not isinstance(policy, customACT) or not isinstance(policy.config, customACTConfig):
+        return {}
+    adapter = getattr(policy.model, "mask_guided_visual_adapter", None)
+    if adapter is None:
+        return {}
+
+    grad_sq_by_group: dict[str, float] = {}
+    param_sq_by_group: dict[str, float] = {}
+    for name, param in adapter.named_parameters():
+        if name.startswith("mask_encoder"):
+            group = "mask_encoder"
+        elif name.startswith("feature_adapter"):
+            group = "feature_adapter"
+        elif name.startswith("target_token"):
+            group = "target_tokens"
+        elif name == "gate_scale":
+            group = "gate_scale"
+        else:
+            group = "other"
+
+        param_sq_by_group[group] = param_sq_by_group.get(group, 0.0) + float(
+            param.detach().float().pow(2).sum().item()
+        )
+        if param.grad is not None:
+            grad_sq_by_group[group] = grad_sq_by_group.get(group, 0.0) + float(
+                param.grad.detach().float().pow(2).sum().item()
+            )
+
+    debug: dict[str, float] = {}
+    total_grad_sq = sum(grad_sq_by_group.values())
+    total_param_sq = sum(param_sq_by_group.values())
+    debug["mask_weight/grad/total_norm"] = total_grad_sq**0.5
+    debug["mask_weight/param/total_norm"] = total_param_sq**0.5
+    for group, grad_sq in grad_sq_by_group.items():
+        debug[f"mask_weight/grad/{group}_norm"] = grad_sq**0.5
+    for group, param_sq in param_sq_by_group.items():
+        debug[f"mask_weight/param/{group}_norm"] = param_sq**0.5
+    return debug
 
 
 def update_policy(
@@ -95,6 +193,8 @@ def update_policy(
 
     # Use accelerator's backward method
     accelerator.backward(loss)
+    unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+    mask_weight_grad_debug = _collect_mask_weight_grad_debug(unwrapped_policy)
 
     # Clip gradients if specified
     if grad_clip_norm > 0:
@@ -122,6 +222,9 @@ def update_policy(
     train_metrics.grad_norm = grad_norm.item()
     train_metrics.lr = optimizer.param_groups[0]["lr"]
     train_metrics.update_s = time.perf_counter() - start_time
+    if mask_weight_grad_debug:
+        output_dict = dict(output_dict or {})
+        output_dict.update(mask_weight_grad_debug)
     return train_metrics, output_dict
 
 
@@ -273,6 +376,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+        _write_customact_mask_weight_config(cfg.output_dir, policy)
 
     # create dataloader for offline training
     if hasattr(cfg.policy, "drop_n_last_frames"):
@@ -361,6 +465,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
         if is_log_step:
             logging.info(train_tracker)
+            _append_mask_weight_debug_log(cfg.output_dir, step, output_dict)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
                 if output_dict:
