@@ -305,6 +305,8 @@ class ACTPolicy(PreTrainedPolicy):
                 mask,
                 self.config.mw_config,
                 apply_mask=sample_apply_mask,
+                min_strength_override=self.config.mw_config.background_consistency_aug_min_strength,
+                max_strength_override=self.config.mw_config.background_consistency_aug_max_strength,
             )
             aug_batch[img_key] = norm_step._apply_transform(
                 aug_img_01,

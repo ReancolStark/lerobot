@@ -37,8 +37,15 @@ class MaskWeightConfig:
     background_aug_keep_threshold: float = 0.05
     background_aug_mode: str = "mixed"  # "random_color", "noise", "mixed", or "shuffle".
     background_aug_noise_p: float = 0.5
+
+    # Default strength range for direct/background augmentation helper calls.
     background_aug_min_strength: float = 1.0
     background_aug_max_strength: float = 1.0
+
+    # Strength range used by the background-consistency auxiliary forward.
+    # Use 0.75~1.0 for the v2-style auxiliary path; set both to 1.0 to match the original v3 behavior.
+    background_consistency_aug_min_strength: float = 0.75
+    background_consistency_aug_max_strength: float = 1.0
 
     # Central controls for mask_weight training/debug metrics.
     record_debug_log: bool = True
@@ -66,6 +73,14 @@ class MaskWeightConfig:
             raise ValueError("background_aug_max_strength must be in [0, 1].")
         if self.background_aug_min_strength > self.background_aug_max_strength:
             raise ValueError("background_aug_min_strength must be <= background_aug_max_strength.")
+        if not 0.0 <= self.background_consistency_aug_min_strength <= 1.0:
+            raise ValueError("background_consistency_aug_min_strength must be in [0, 1].")
+        if not 0.0 <= self.background_consistency_aug_max_strength <= 1.0:
+            raise ValueError("background_consistency_aug_max_strength must be in [0, 1].")
+        if self.background_consistency_aug_min_strength > self.background_consistency_aug_max_strength:
+            raise ValueError(
+                "background_consistency_aug_min_strength must be <= background_consistency_aug_max_strength."
+            )
         if self.adapter_hidden_dim <= 0:
             raise ValueError("adapter_hidden_dim must be positive.")
         if self.context_dilation < 0:

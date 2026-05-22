@@ -61,6 +61,11 @@ def test_mask_weight_config_rejects_invalid_mode():
 def test_mask_weight_config_rejects_invalid_background_strength():
     with pytest.raises(ValueError):
         MaskWeightConfig(background_aug_min_strength=0.9, background_aug_max_strength=0.2)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(
+            background_consistency_aug_min_strength=0.9,
+            background_consistency_aug_max_strength=0.2,
+        )
 
 
 def test_mask_guided_background_augmentation_preserves_target_and_changes_background():
