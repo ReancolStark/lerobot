@@ -34,10 +34,9 @@ class MaskWeightConfig:
 
     # Training-time background counterfactuals.
     use_background_augmentation: bool = True
-    # Kept for compatibility with older configs; the current path is single-forward.
-    use_background_consistency: bool = False
+    # Adds a second, background-augmented forward pass and penalizes action drift.
+    use_background_consistency: bool = True
     background_aug_p: float = 0.5
-    # Kept for compatibility with older configs; unused when consistency is off.
     background_consistency_loss_weight: float = 0.1
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05
