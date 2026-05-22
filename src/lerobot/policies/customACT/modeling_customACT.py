@@ -187,7 +187,12 @@ class ACTPolicy(PreTrainedPolicy):
         else:
             loss = l1_loss
 
-        mask_weight_debug = dict(getattr(self.model, "latest_mask_weight_debug", None) or {})
+        record_mask_weight_debug = self._should_record_mask_weight_debug()
+        mask_weight_debug = (
+            dict(getattr(self.model, "latest_mask_weight_debug", None) or {})
+            if record_mask_weight_debug
+            else {}
+        )
         mask_weight_masks = dict(getattr(self.model, "latest_mask_weight_masks", None) or {})
         background_debug: dict[str, float | bool] = {}
         if self._should_use_mask_weight_background_consistency():
@@ -211,17 +216,27 @@ class ACTPolicy(PreTrainedPolicy):
                 consistency_weight = float(self.config.mw_config.background_consistency_loss_weight)
                 loss = loss + consistency_loss * consistency_weight
 
-                with torch.no_grad():
+                if record_mask_weight_debug:
                     masked_delta = action_delta.detach() * valid_action
-                    background_debug["mask_weight/bg_aug/consistency_loss"] = float(
-                        consistency_loss.detach().item()
-                    )
+                    valid_denom = (valid_action.sum() * action_delta.shape[-1]).clamp(min=1)
+                    action_delta_l1 = masked_delta.sum() / valid_denom
+                    action_delta_max = masked_delta.max()
+                    consistency_loss_value = float(consistency_loss.detach().item())
+                    consistency_weighted_value = float((consistency_loss.detach() * consistency_weight).item())
+                    action_delta_l1_value = float(action_delta_l1.detach().item())
+                    action_delta_max_value = float(action_delta_max.detach().item())
+                    background_debug["mask_weight/bg_aug/consistency_loss"] = consistency_loss_value
                     background_debug["mask_weight/bg_aug/consistency_weight"] = consistency_weight
-                    background_debug["mask_weight/bg_aug/action_delta_l1"] = float(
-                        consistency_loss.detach().item()
-                    )
-                    background_debug["mask_weight/bg_aug/action_delta_max"] = float(masked_delta.max().item())
-            else:
+                    background_debug["mask_weight/bg_aug/action_delta_l1"] = action_delta_l1_value
+                    background_debug["mask_weight/bg_aug/action_delta_max"] = action_delta_max_value
+                    background_debug["mask_weight/consistency/enabled"] = 1.0
+                    background_debug["mask_weight/consistency/weight"] = consistency_weight
+                    background_debug["mask_weight/consistency/loss"] = consistency_loss_value
+                    background_debug["mask_weight/consistency/weighted_loss"] = consistency_weighted_value
+                    background_debug["mask_weight/consistency/action_delta_l1"] = action_delta_l1_value
+                    background_debug["mask_weight/consistency/action_delta_max"] = action_delta_max_value
+                    background_debug["mask_weight/consistency/latent_reused"] = float(latent_sample is not None)
+            elif record_mask_weight_debug:
                 background_debug = {
                     "mask_weight/bg_aug/enabled": True,
                     "mask_weight/bg_aug/applied_ratio": 0.0,
@@ -234,6 +249,9 @@ class ACTPolicy(PreTrainedPolicy):
             loss_dict.update(background_debug)
 
         return loss, loss_dict
+
+    def _should_record_mask_weight_debug(self) -> bool:
+        return self.config.use_mask_weight and bool(getattr(self.config.mw_config, "record_debug_log", True))
 
     def _should_use_mask_weight_background_consistency(self) -> bool:
         mw_config = self.config.mw_config
@@ -806,7 +824,9 @@ class ACT(nn.Module):
         yolo_results_by_img_key = {}
         imgs_for_yolo_by_img_key = {}
         forced_mask_weight_masks = batch.get(_MASK_WEIGHT_FORCED_MASKS, None)
-        skip_mask_weight_debug = bool(batch.get(_MASK_WEIGHT_SKIP_DEBUG, False))
+        skip_mask_weight_debug = bool(batch.get(_MASK_WEIGHT_SKIP_DEBUG, False)) or not bool(
+            getattr(self.config.mw_config, "record_debug_log", True)
+        )
 
         if self.config.use_segment_understanding:
             cam_key = f"observation.images.{self.config.seg_config.camera_name}"

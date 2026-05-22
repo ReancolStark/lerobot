@@ -37,6 +37,11 @@ class MaskWeightConfig:
     background_aug_keep_threshold: float = 0.05
     background_aug_mode: str = "mixed"  # "random_color", "noise", "mixed", or "shuffle".
     background_aug_noise_p: float = 0.5
+    background_aug_min_strength: float = 1.0
+    background_aug_max_strength: float = 1.0
+
+    # Central controls for mask_weight training/debug metrics.
+    record_debug_log: bool = True
 
     def __post_init__(self):
         if self.mode not in {"adapter", "legacy_multiply"}:
@@ -55,6 +60,12 @@ class MaskWeightConfig:
             raise ValueError(f"Unknown background_aug_mode={self.background_aug_mode!r}.")
         if not 0.0 <= self.background_aug_noise_p <= 1.0:
             raise ValueError("background_aug_noise_p must be in [0, 1].")
+        if not 0.0 <= self.background_aug_min_strength <= 1.0:
+            raise ValueError("background_aug_min_strength must be in [0, 1].")
+        if not 0.0 <= self.background_aug_max_strength <= 1.0:
+            raise ValueError("background_aug_max_strength must be in [0, 1].")
+        if self.background_aug_min_strength > self.background_aug_max_strength:
+            raise ValueError("background_aug_min_strength must be <= background_aug_max_strength.")
         if self.adapter_hidden_dim <= 0:
             raise ValueError("adapter_hidden_dim must be positive.")
         if self.context_dilation < 0:

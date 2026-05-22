@@ -87,6 +87,8 @@ def make_mask_guided_background_augmentation(
     masks: torch.Tensor,
     config: MaskWeightConfig,
     apply_mask: torch.Tensor | None = None,
+    min_strength_override: float | None = None,
+    max_strength_override: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Replace background pixels while preserving the YOLO target and context.
 
@@ -95,6 +97,8 @@ def make_mask_guided_background_augmentation(
         masks: YOLO soft masks shaped [B, 1, H, W] or resizable to image size.
         config: MaskWeightConfig with background augmentation parameters.
         apply_mask: Optional per-sample boolean mask shaped [B, 1, 1, 1].
+        min_strength_override: Optional lower bound for background replacement strength.
+        max_strength_override: Optional upper bound for background replacement strength.
 
     Returns:
         Augmented images and tensor debug metrics. Samples without a detected mask
@@ -169,15 +173,54 @@ def make_mask_guided_background_augmentation(
         ) < float(config.background_aug_noise_p)
         background = torch.where(use_noise, noise, random_color)
 
-    candidate = keep_mask * images + (1.0 - keep_mask) * background
+    min_strength = (
+        float(config.background_aug_min_strength)
+        if min_strength_override is None
+        else float(min_strength_override)
+    )
+    max_strength = (
+        float(config.background_aug_max_strength)
+        if max_strength_override is None
+        else float(max_strength_override)
+    )
+    if not 0.0 <= min_strength <= 1.0 or not 0.0 <= max_strength <= 1.0:
+        raise ValueError("background augmentation strength bounds must be in [0, 1].")
+    if min_strength > max_strength:
+        raise ValueError("background augmentation min strength must be <= max strength.")
+    if min_strength == max_strength:
+        strength = torch.full(
+            (batch_size, 1, 1, 1),
+            min_strength,
+            dtype=images.dtype,
+            device=images.device,
+        )
+    else:
+        strength = min_strength + torch.rand(
+            batch_size,
+            1,
+            1,
+            1,
+            dtype=images.dtype,
+            device=images.device,
+        ) * (max_strength - min_strength)
+    mixed_background = images * (1.0 - strength) + background * strength
+
+    candidate = keep_mask * images + (1.0 - keep_mask) * mixed_background
     augmented = torch.where(apply_mask, candidate, images)
     augmented = torch.clamp(augmented, 0.0, 1.0)
 
-    replaced = apply_mask.to(dtype=images.dtype) * (1.0 - keep_mask)
+    applied = apply_mask.to(dtype=images.dtype)
+    replaced = applied * (1.0 - keep_mask)
+    effective_change = replaced * strength
+    applied_strength = (strength * applied).sum() / applied.sum().clamp(min=1.0)
     debug = {
         "applied_ratio": apply_mask.detach().float().mean(),
         "keep_mask_mean": keep_mask.detach().float().mean(),
         "background_replaced_ratio": replaced.detach().float().mean(),
+        "background_effective_change_ratio": effective_change.detach().float().mean(),
+        "strength_mean": applied_strength.detach().float(),
+        "strength_min": torch.as_tensor(min_strength, dtype=images.dtype, device=images.device),
+        "strength_max": torch.as_tensor(max_strength, dtype=images.dtype, device=images.device),
         "image_delta_l1": (augmented.detach() - images.detach()).abs().float().mean(),
     }
     return augmented, debug
@@ -324,9 +367,31 @@ class MaskGuidedVisualAdapter(nn.Module):
             return guided_features, target_tokens, target_pos_embed
 
         with torch.no_grad():
-            visual_rms = visual_features.detach().float().pow(2).mean().sqrt().clamp(min=1e-6)
-            output_delta = guided_features.detach() - visual_features.detach()
+            visual_float = visual_features.detach().float()
+            guided_float = guided_features.detach().float()
+
+            def _masked_rms(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+                weights_float = weights.detach().float()
+                weighted_energy = values.pow(2) * weights_float
+                denom = (weights_float.sum() * values.shape[1]).clamp(min=1e-6)
+                return (weighted_energy.sum() / denom).sqrt()
+
+            visual_rms = visual_float.pow(2).mean().sqrt().clamp(min=1e-6)
+            output_delta = guided_float - visual_float
             output_delta_rms = output_delta.float().pow(2).mean().sqrt()
+            input_target_rms = _masked_rms(visual_float, target_mask)
+            input_background_rms = _masked_rms(visual_float, background_mask)
+            output_target_rms = _masked_rms(guided_float, target_mask)
+            output_background_rms = _masked_rms(guided_float, background_mask)
+            target_background_ratio_before = input_target_rms / input_background_rms.clamp(min=1e-6)
+            target_background_ratio_after = output_target_rms / output_background_rms.clamp(min=1e-6)
+            target_background_ratio_gain = target_background_ratio_after / target_background_ratio_before.clamp(
+                min=1e-6
+            )
+            target_delta_ratio = _masked_rms(output_delta, target_mask) / input_target_rms.clamp(min=1e-6)
+            background_delta_ratio = _masked_rms(output_delta, background_mask) / input_background_rms.clamp(
+                min=1e-6
+            )
             spatial_delta_rms = (
                 torch.zeros((), device=visual_features.device)
                 if spatial_delta is None
@@ -345,6 +410,15 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "residual_delta_ratio": float((residual_delta_rms / visual_rms).item()),
                 "output_delta_rms": float(output_delta_rms.item()),
                 "output_delta_ratio": float((output_delta_rms / visual_rms).item()),
+                "input_target_rms": float(input_target_rms.item()),
+                "input_background_rms": float(input_background_rms.item()),
+                "output_target_rms": float(output_target_rms.item()),
+                "output_background_rms": float(output_background_rms.item()),
+                "target_background_rms_ratio_before": float(target_background_ratio_before.item()),
+                "target_background_rms_ratio_after": float(target_background_ratio_after.item()),
+                "target_background_rms_ratio_gain": float(target_background_ratio_gain.item()),
+                "target_delta_ratio": float(target_delta_ratio.item()),
+                "background_delta_ratio": float(background_delta_ratio.item()),
                 "target_mask_mean": float(target_mask.detach().float().mean().item()),
                 "context_mask_mean": float(context_mask.detach().float().mean().item()),
                 "background_mask_mean": float(background_mask.detach().float().mean().item()),

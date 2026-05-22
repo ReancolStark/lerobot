@@ -247,19 +247,18 @@ def main() -> None:
         background_aug_context_dilation=args.context_dilation,
         background_aug_keep_threshold=args.keep_threshold,
         background_aug_mode=args.mode,
+        background_aug_min_strength=strength,
+        background_aug_max_strength=strength,
     )
     apply_mask = torch.ones(image_tensor.shape[0], 1, 1, 1, dtype=torch.bool)
-    full_replaced_tensor, debug = make_mask_guided_background_augmentation(
+    replaced_tensor, debug = make_mask_guided_background_augmentation(
         image_tensor,
         yolo_mask,
         config,
         apply_mask=apply_mask,
+        min_strength_override=strength,
+        max_strength_override=strength,
     )
-    replaced_tensor = image_tensor * (1.0 - strength) + full_replaced_tensor * strength
-    debug = dict(debug)
-    debug["strength_mean"] = torch.tensor(float(strength))
-    debug["image_delta_l1_full_strength"] = debug["image_delta_l1"]
-    debug["image_delta_l1"] = (replaced_tensor.detach() - image_tensor.detach()).abs().float().mean()
 
     overlay_rgb = processor.draw_results_on_frame(image_rgb, results[0])
     mask_rgb = _mask_to_rgb_image(yolo_mask[0])

@@ -99,7 +99,24 @@ def _write_customact_mask_weight_config(output_dir, policy: PreTrainedPolicy) ->
         json.dump(config_payload, f, indent=2, ensure_ascii=False)
 
 
-def _append_mask_weight_debug_log(output_dir, step: int, output_dict: dict | None) -> None:
+def _get_customact_mask_weight_config(policy: PreTrainedPolicy):
+    if not isinstance(policy, customACT) or not isinstance(policy.config, customACTConfig):
+        return None
+    if not policy.config.use_mask_weight:
+        return None
+    return policy.config.mw_config
+
+
+def _mask_weight_debug_enabled(policy: PreTrainedPolicy) -> bool:
+    mw_config = _get_customact_mask_weight_config(policy)
+    return bool(mw_config is not None and getattr(mw_config, "record_debug_log", True))
+
+
+def _append_mask_weight_debug_log(
+    output_dir,
+    step: int,
+    output_dict: dict | None,
+) -> None:
     if not output_dict:
         return
     debug_dict = {
@@ -117,6 +134,8 @@ def _append_mask_weight_debug_log(output_dir, step: int, output_dict: dict | Non
 
 
 def _collect_mask_weight_grad_debug(policy: PreTrainedPolicy) -> dict[str, float]:
+    if not _mask_weight_debug_enabled(policy):
+        return {}
     if not isinstance(policy, customACT) or not isinstance(policy.config, customACTConfig):
         return {}
     adapter = getattr(policy.model, "mask_guided_visual_adapter", None)

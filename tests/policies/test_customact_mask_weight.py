@@ -22,6 +22,11 @@ def test_mask_guided_visual_adapter_shapes_and_gradient():
     assert guided_features.shape == features.shape
     assert target_tokens is None
     assert target_pos_embed is None
+    assert adapter.latest_debug["target_background_rms_ratio_before"] > 0.0
+    assert adapter.latest_debug["target_background_rms_ratio_after"] > 0.0
+    assert adapter.latest_debug["target_background_rms_ratio_gain"] > 0.0
+    assert adapter.latest_debug["target_delta_ratio"] >= 0.0
+    assert adapter.latest_debug["background_delta_ratio"] >= 0.0
 
     guided_features.mean().backward()
     assert adapter.gate_scale.grad is not None
@@ -53,6 +58,11 @@ def test_mask_weight_config_rejects_invalid_mode():
         MaskWeightConfig(mode="bad_mode")
 
 
+def test_mask_weight_config_rejects_invalid_background_strength():
+    with pytest.raises(ValueError):
+        MaskWeightConfig(background_aug_min_strength=0.9, background_aug_max_strength=0.2)
+
+
 def test_mask_guided_background_augmentation_preserves_target_and_changes_background():
     torch.manual_seed(0)
     config = MaskWeightConfig(
@@ -72,6 +82,10 @@ def test_mask_guided_background_augmentation_preserves_target_and_changes_backgr
     assert not torch.allclose(augmented * (1.0 - masks), images * (1.0 - masks))
     assert debug["applied_ratio"].item() == pytest.approx(1.0)
     assert debug["background_replaced_ratio"].item() == pytest.approx(0.75)
+    assert debug["background_effective_change_ratio"].item() == pytest.approx(0.75)
+    assert debug["strength_mean"].item() == pytest.approx(1.0)
+    assert debug["strength_min"].item() == pytest.approx(1.0)
+    assert debug["strength_max"].item() == pytest.approx(1.0)
 
 
 def test_mask_guided_background_augmentation_skips_samples_without_mask():
@@ -84,3 +98,29 @@ def test_mask_guided_background_augmentation_skips_samples_without_mask():
 
     assert torch.allclose(augmented, images)
     assert debug["applied_ratio"].item() == pytest.approx(0.0)
+
+
+def test_mask_guided_background_augmentation_strength_override():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        background_aug_p=1.0,
+        background_aug_context_dilation=0,
+        background_aug_keep_threshold=0.5,
+        background_aug_mode="random_color",
+    )
+    images = torch.zeros(2, 3, 4, 4)
+    masks = torch.zeros(2, 1, 4, 4)
+    masks[:, :, 1:3, 1:3] = 1.0
+
+    _, debug = make_mask_guided_background_augmentation(
+        images,
+        masks,
+        config,
+        min_strength_override=0.8,
+        max_strength_override=0.8,
+    )
+
+    assert debug["strength_min"].item() == pytest.approx(0.8)
+    assert debug["strength_max"].item() == pytest.approx(0.8)
+    assert debug["strength_mean"].item() == pytest.approx(0.8)
+    assert debug["background_effective_change_ratio"].item() == pytest.approx(0.6)
