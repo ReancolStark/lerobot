@@ -197,7 +197,6 @@ class ACTPolicy(PreTrainedPolicy):
         self.model.enable_debug_visualization = enable
         if not enable:
             self.model.latest_yolo_debug_overlays = {}
-            self.model.debug_yolo_overlay_ttl = {}
 
     def get_debug_observation_images(self) -> dict[str, np.ndarray]:
         overlays = getattr(self.model, "latest_yolo_debug_overlays", None)
@@ -209,13 +208,6 @@ class ACTPolicy(PreTrainedPolicy):
             for key, value in mask_weight_debug.items():
                 if isinstance(value, (int, float, bool)):
                     output[f"custom.{key.replace('/', '.')}"] = np.array(value, dtype=np.float32)
-        ttl = getattr(self.model, "debug_yolo_overlay_ttl", None)
-        if ttl is not None:
-            for key in list(ttl):
-                ttl[key] -= 1
-                if ttl[key] <= 0:
-                    ttl.pop(key, None)
-                    overlays.pop(key, None)
         return output
         
 
@@ -359,7 +351,6 @@ class ACT(nn.Module):
         self.config = config
         self.enable_debug_visualization = False
         self.latest_yolo_debug_overlays: dict[str, np.ndarray] = {}
-        self.debug_yolo_overlay_ttl: dict[str, int] = {}
         self.debug_yolo_call_count = 0
         self.latest_mask_weight_debug: dict[str, float | str | bool] = {}
 
@@ -522,7 +513,6 @@ class ACT(nn.Module):
         yolo_results,
         sources: tuple[str, ...],
         overlay_interval: int = 1,
-        overlay_hold_frames: int = 8,
     ) -> None:
         """Record Rerun debug data from the exact YOLO result consumed by policy branches."""
         if not self.enable_debug_visualization or yolo_results is None:
@@ -548,12 +538,10 @@ class ACT(nn.Module):
             return
 
         overlay = self.yolo_data_processer.make_debug_overlay_chw(imgs_for_yolo[0], yolo_results[0])
-        hold_frames = max(1, int(overlay_hold_frames))
         overlay_keys = [f"custom.yolo_overlay.{source}.{cam_name}" for source in sources]
         overlay_keys.append(f"custom.yolo_overlay.{cam_name}")
         for key in overlay_keys:
             self.latest_yolo_debug_overlays[key] = overlay
-            self.debug_yolo_overlay_ttl[key] = hold_frames
 
 
     def _reset_parameters(self):
@@ -688,7 +676,6 @@ class ACT(nn.Module):
                 yolo_results,
                 ("segment",),
                 overlay_interval=1,
-                overlay_hold_frames=8,
             )
 
             yolo_r_list = []
@@ -736,7 +723,6 @@ class ACT(nn.Module):
                         yolo_results,
                         ("mask_weight",),
                         overlay_interval=1,
-                        overlay_hold_frames=8,
                     )
                     yolo_mask = yolo_result_to_soft_mask(
                         yolo_results,
