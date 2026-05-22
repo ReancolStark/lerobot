@@ -77,6 +77,15 @@ def _write_customact_mask_weight_config(output_dir, policy: PreTrainedPolicy) ->
 
     output_dir.mkdir(parents=True, exist_ok=True)
     mw_config = policy.config.mw_config
+    tested_path = (
+        "Mask-Guided Visual Adapter + optional target tokens"
+        if mw_config.mode == "adapter"
+        else "Legacy fixed hard multiply"
+    )
+    if getattr(mw_config, "use_background_augmentation", False):
+        tested_path += " + mask-guided background augmentation"
+    if getattr(mw_config, "use_background_consistency", False):
+        tested_path += " + action consistency loss"
     config_payload = {
         "policy_type": getattr(policy.config, "type", "customACT"),
         "use_mask_weight": policy.config.use_mask_weight,
@@ -84,11 +93,7 @@ def _write_customact_mask_weight_config(output_dir, policy: PreTrainedPolicy) ->
         "use_yolo": policy.config.use_yolo,
         "vision_backbone": policy.config.vision_backbone,
         "mask_weight": _json_safe(vars(mw_config)),
-        "tested_path": (
-            "Mask-Guided Visual Adapter + optional target tokens"
-            if mw_config.mode == "adapter"
-            else "Legacy fixed hard multiply"
-        ),
+        "tested_path": tested_path,
     }
     with open(output_dir / "mask_weight_config.json", "w", encoding="utf-8") as f:
         json.dump(config_payload, f, indent=2, ensure_ascii=False)

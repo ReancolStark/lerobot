@@ -2,7 +2,10 @@ import pytest
 import torch
 
 from lerobot.policies.customACT.mask_weight.configuration_mask_weight import MaskWeightConfig
-from lerobot.policies.customACT.mask_weight.mask_weight import MaskGuidedVisualAdapter
+from lerobot.policies.customACT.mask_weight.mask_weight import (
+    MaskGuidedVisualAdapter,
+    make_mask_guided_background_augmentation,
+)
 
 
 def test_mask_guided_visual_adapter_shapes_and_gradient():
@@ -48,3 +51,36 @@ def test_mask_guided_visual_adapter_target_tokens():
 def test_mask_weight_config_rejects_invalid_mode():
     with pytest.raises(ValueError):
         MaskWeightConfig(mode="bad_mode")
+
+
+def test_mask_guided_background_augmentation_preserves_target_and_changes_background():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        background_aug_p=1.0,
+        background_aug_context_dilation=0,
+        background_aug_keep_threshold=0.5,
+        background_aug_mode="random_color",
+    )
+    images = torch.zeros(2, 3, 4, 4)
+    images[:, :, 1:3, 1:3] = 0.7
+    masks = torch.zeros(2, 1, 4, 4)
+    masks[:, :, 1:3, 1:3] = 1.0
+
+    augmented, debug = make_mask_guided_background_augmentation(images, masks, config)
+
+    assert torch.allclose(augmented[:, :, 1:3, 1:3], images[:, :, 1:3, 1:3])
+    assert not torch.allclose(augmented * (1.0 - masks), images * (1.0 - masks))
+    assert debug["applied_ratio"].item() == pytest.approx(1.0)
+    assert debug["background_replaced_ratio"].item() == pytest.approx(0.75)
+
+
+def test_mask_guided_background_augmentation_skips_samples_without_mask():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(background_aug_p=1.0)
+    images = torch.rand(2, 3, 4, 4)
+    masks = torch.zeros(2, 1, 4, 4)
+
+    augmented, debug = make_mask_guided_background_augmentation(images, masks, config)
+
+    assert torch.allclose(augmented, images)
+    assert debug["applied_ratio"].item() == pytest.approx(0.0)

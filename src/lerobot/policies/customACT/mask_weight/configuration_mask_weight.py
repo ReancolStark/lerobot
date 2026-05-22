@@ -27,11 +27,34 @@ class MaskWeightConfig:
     mask_blur_kernel_size: int = 7
     mask_blur_sigma: float = 2.0
 
+    # Training-time background counterfactuals. These are off by default because
+    # consistency training requires an extra policy forward pass.
+    use_background_augmentation: bool = True
+    use_background_consistency: bool = True
+    background_aug_p: float = 0.5
+    background_consistency_loss_weight: float = 0.1
+    background_aug_context_dilation: int = 21
+    background_aug_keep_threshold: float = 0.05
+    background_aug_mode: str = "mixed"  # "random_color", "noise", "mixed", or "shuffle".
+    background_aug_noise_p: float = 0.5
+
     def __post_init__(self):
         if self.mode not in {"adapter", "legacy_multiply"}:
             raise ValueError(f"Unknown MaskWeightConfig.mode={self.mode!r}.")
         if not 0.0 <= self.mask_dropout_p <= 1.0:
             raise ValueError("mask_dropout_p must be in [0, 1].")
+        if not 0.0 <= self.background_aug_p <= 1.0:
+            raise ValueError("background_aug_p must be in [0, 1].")
+        if self.background_consistency_loss_weight < 0.0:
+            raise ValueError("background_consistency_loss_weight must be non-negative.")
+        if self.background_aug_context_dilation < 0:
+            raise ValueError("background_aug_context_dilation must be non-negative.")
+        if not 0.0 <= self.background_aug_keep_threshold <= 1.0:
+            raise ValueError("background_aug_keep_threshold must be in [0, 1].")
+        if self.background_aug_mode not in {"random_color", "noise", "mixed", "shuffle"}:
+            raise ValueError(f"Unknown background_aug_mode={self.background_aug_mode!r}.")
+        if not 0.0 <= self.background_aug_noise_p <= 1.0:
+            raise ValueError("background_aug_noise_p must be in [0, 1].")
         if self.adapter_hidden_dim <= 0:
             raise ValueError("adapter_hidden_dim must be positive.")
         if self.context_dilation < 0:

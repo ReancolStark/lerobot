@@ -82,6 +82,107 @@ def yolo_result_to_soft_mask(
     return torch.stack(soft_masks, dim=0)
 
 
+def make_mask_guided_background_augmentation(
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    config: MaskWeightConfig,
+    apply_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Replace background pixels while preserving the YOLO target and context.
+
+    Args:
+        images: Unnormalized image batch in [0, 1], shaped [B, C, H, W].
+        masks: YOLO soft masks shaped [B, 1, H, W] or resizable to image size.
+        config: MaskWeightConfig with background augmentation parameters.
+        apply_mask: Optional per-sample boolean mask shaped [B, 1, 1, 1].
+
+    Returns:
+        Augmented images and tensor debug metrics. Samples without a detected mask
+        are left unchanged.
+    """
+    if images.ndim != 4:
+        raise ValueError(f"images must have shape [B, C, H, W], got {tuple(images.shape)}.")
+    if masks.ndim != 4 or masks.shape[1] != 1:
+        raise ValueError(f"masks must have shape [B, 1, H, W], got {tuple(masks.shape)}.")
+    if images.shape[0] != masks.shape[0]:
+        raise ValueError("images and masks must have the same batch size.")
+
+    masks = masks.to(dtype=images.dtype, device=images.device)
+    if masks.shape[-2:] != images.shape[-2:]:
+        masks = F.interpolate(masks, size=images.shape[-2:], mode="bilinear", align_corners=False)
+    masks = torch.clamp(masks, 0.0, 1.0)
+
+    dilation = int(config.background_aug_context_dilation)
+    if dilation > 0:
+        kernel_size = 2 * dilation + 1
+        keep_mask = F.max_pool2d(masks, kernel_size=kernel_size, stride=1, padding=dilation)
+    else:
+        keep_mask = masks
+    keep_mask = torch.clamp(keep_mask, 0.0, 1.0)
+
+    threshold = float(config.background_aug_keep_threshold)
+    has_target = keep_mask.amax(dim=(2, 3), keepdim=True) > threshold
+    if threshold > 0.0:
+        keep_mask = (keep_mask > threshold).to(dtype=images.dtype)
+
+    batch_size, channels, _, _ = images.shape
+    if apply_mask is None:
+        apply_mask = torch.rand(
+            batch_size,
+            1,
+            1,
+            1,
+            dtype=images.dtype,
+            device=images.device,
+        ) < float(config.background_aug_p)
+    else:
+        apply_mask = apply_mask.to(device=images.device).bool()
+    apply_mask = apply_mask & has_target
+
+    random_color = torch.rand(
+        batch_size,
+        channels,
+        1,
+        1,
+        dtype=images.dtype,
+        device=images.device,
+    ).expand_as(images)
+    noise = torch.rand_like(images)
+
+    if config.background_aug_mode == "random_color":
+        background = random_color
+    elif config.background_aug_mode == "noise":
+        background = noise
+    elif config.background_aug_mode == "shuffle":
+        if batch_size > 1:
+            background = images[torch.randperm(batch_size, device=images.device)]
+        else:
+            background = random_color
+    else:
+        use_noise = torch.rand(
+            batch_size,
+            1,
+            1,
+            1,
+            dtype=images.dtype,
+            device=images.device,
+        ) < float(config.background_aug_noise_p)
+        background = torch.where(use_noise, noise, random_color)
+
+    candidate = keep_mask * images + (1.0 - keep_mask) * background
+    augmented = torch.where(apply_mask, candidate, images)
+    augmented = torch.clamp(augmented, 0.0, 1.0)
+
+    replaced = apply_mask.to(dtype=images.dtype) * (1.0 - keep_mask)
+    debug = {
+        "applied_ratio": apply_mask.detach().float().mean(),
+        "keep_mask_mean": keep_mask.detach().float().mean(),
+        "background_replaced_ratio": replaced.detach().float().mean(),
+        "image_delta_l1": (augmented.detach() - images.detach()).abs().float().mean(),
+    }
+    return augmented, debug
+
+
 class MaskGuidedVisualAdapter(nn.Module):
     """Inject YOLO-derived spatial priors into projected ACT visual features.
 
@@ -191,7 +292,12 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_pos_embed = self.target_token_pos_embed.to(dtype=features.dtype, device=features.device)
         return target_tokens, target_pos_embed
 
-    def forward(self, visual_features: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        mask: torch.Tensor,
+        record_debug: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         mask = mask.to(dtype=visual_features.dtype, device=visual_features.device)
         target_mask, context_mask, background_mask, confidence_map = self._build_guidance(mask)
         guidance = torch.cat([target_mask, context_mask, background_mask, confidence_map], dim=1)
@@ -213,6 +319,10 @@ class MaskGuidedVisualAdapter(nn.Module):
             context_mask,
             background_mask,
         )
+        if not record_debug:
+            self.latest_debug = {}
+            return guided_features, target_tokens, target_pos_embed
+
         with torch.no_grad():
             visual_rms = visual_features.detach().float().pow(2).mean().sqrt().clamp(min=1e-6)
             output_delta = guided_features.detach() - visual_features.detach()
