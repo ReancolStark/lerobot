@@ -169,15 +169,32 @@ def make_mask_guided_background_augmentation(
         ) < float(config.background_aug_noise_p)
         background = torch.where(use_noise, noise, random_color)
 
-    candidate = keep_mask * images + (1.0 - keep_mask) * background
+    min_strength = float(config.background_aug_min_strength)
+    max_strength = float(config.background_aug_max_strength)
+    strength = min_strength + torch.rand(
+        batch_size,
+        1,
+        1,
+        1,
+        dtype=images.dtype,
+        device=images.device,
+    ) * (max_strength - min_strength)
+    mixed_background = images * (1.0 - strength) + background * strength
+
+    candidate = keep_mask * images + (1.0 - keep_mask) * mixed_background
     augmented = torch.where(apply_mask, candidate, images)
     augmented = torch.clamp(augmented, 0.0, 1.0)
 
-    replaced = apply_mask.to(dtype=images.dtype) * (1.0 - keep_mask)
+    applied = apply_mask.to(dtype=images.dtype)
+    replaced = applied * (1.0 - keep_mask)
+    effective_change = replaced * strength
+    applied_strength = (strength * applied).sum() / applied.sum().clamp(min=1.0)
     debug = {
         "applied_ratio": apply_mask.detach().float().mean(),
         "keep_mask_mean": keep_mask.detach().float().mean(),
         "background_replaced_ratio": replaced.detach().float().mean(),
+        "background_effective_change_ratio": effective_change.detach().float().mean(),
+        "strength_mean": applied_strength.detach().float(),
         "image_delta_l1": (augmented.detach() - images.detach()).abs().float().mean(),
     }
     return augmented, debug

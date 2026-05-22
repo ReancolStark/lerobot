@@ -84,8 +84,6 @@ def _write_customact_mask_weight_config(output_dir, policy: PreTrainedPolicy) ->
     )
     if getattr(mw_config, "use_background_augmentation", False):
         tested_path += " + mask-guided background augmentation"
-    if getattr(mw_config, "use_background_consistency", False):
-        tested_path += " + action consistency loss"
     config_payload = {
         "policy_type": getattr(policy.config, "type", "customACT"),
         "use_mask_weight": policy.config.use_mask_weight,

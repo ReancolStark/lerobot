@@ -60,6 +60,8 @@ def test_mask_guided_background_augmentation_preserves_target_and_changes_backgr
         background_aug_context_dilation=0,
         background_aug_keep_threshold=0.5,
         background_aug_mode="random_color",
+        background_aug_min_strength=1.0,
+        background_aug_max_strength=1.0,
     )
     images = torch.zeros(2, 3, 4, 4)
     images[:, :, 1:3, 1:3] = 0.7
@@ -72,6 +74,7 @@ def test_mask_guided_background_augmentation_preserves_target_and_changes_backgr
     assert not torch.allclose(augmented * (1.0 - masks), images * (1.0 - masks))
     assert debug["applied_ratio"].item() == pytest.approx(1.0)
     assert debug["background_replaced_ratio"].item() == pytest.approx(0.75)
+    assert debug["strength_mean"].item() == pytest.approx(1.0)
 
 
 def test_mask_guided_background_augmentation_skips_samples_without_mask():
