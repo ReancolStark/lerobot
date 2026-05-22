@@ -126,6 +126,8 @@ def _collect_mask_weight_grad_debug(policy: PreTrainedPolicy) -> dict[str, float
     for name, param in adapter.named_parameters():
         if name.startswith("mask_encoder"):
             group = "mask_encoder"
+        elif name in {"target_boost_scale", "context_boost_scale", "background_suppress_scale"}:
+            group = "region_modulation"
         elif name.startswith("feature_adapter"):
             group = "feature_adapter"
         elif name.startswith("target_token"):

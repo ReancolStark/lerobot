@@ -14,6 +14,7 @@ class MaskWeightConfig:
     # Mask-guided adapter switches.
     use_spatial_embedding: bool = True
     use_residual_gate: bool = True
+    use_region_modulation: bool = True
     use_target_tokens: bool = False
 
     # Mask-guided adapter hyperparameters.
@@ -22,6 +23,10 @@ class MaskWeightConfig:
     context_dilation: int = 3
     mask_dropout_p: float = 0.1
     num_target_tokens: int = 2
+    target_boost_init: float = 0.15
+    context_boost_init: float = 0.05
+    background_suppress_init: float = 0.18
+    region_modulation_max: float = 0.5
 
     # YOLO mask post-processing.
     mask_blur_kernel_size: int = 7
@@ -70,3 +75,9 @@ class MaskWeightConfig:
             raise ValueError("context_dilation must be non-negative.")
         if self.num_target_tokens < 0:
             raise ValueError("num_target_tokens must be non-negative.")
+        for name in ("target_boost_init", "context_boost_init", "background_suppress_init"):
+            value = getattr(self, name)
+            if value < 0.0:
+                raise ValueError(f"{name} must be non-negative.")
+        if self.region_modulation_max <= 0.0:
+            raise ValueError("region_modulation_max must be positive.")

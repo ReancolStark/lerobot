@@ -226,6 +226,15 @@ class MaskGuidedVisualAdapter(nn.Module):
         else:
             self.mask_encoder = None
 
+        if config.use_region_modulation:
+            self.target_boost_scale = nn.Parameter(torch.tensor(float(config.target_boost_init)))
+            self.context_boost_scale = nn.Parameter(torch.tensor(float(config.context_boost_init)))
+            self.background_suppress_scale = nn.Parameter(torch.tensor(float(config.background_suppress_init)))
+        else:
+            self.register_parameter("target_boost_scale", None)
+            self.register_parameter("context_boost_scale", None)
+            self.register_parameter("background_suppress_scale", None)
+
         if config.use_residual_gate:
             self.feature_adapter = nn.Sequential(
                 nn.Conv2d(dim_model, dim_model, kernel_size=1),
@@ -325,6 +334,23 @@ class MaskGuidedVisualAdapter(nn.Module):
             spatial_delta = self.mask_encoder(guidance)
             guided_features = guided_features + spatial_delta
 
+        region_delta = None
+        region_gain = None
+        if self.target_boost_scale is not None:
+            max_scale = float(self.config.region_modulation_max)
+            target_boost = torch.clamp(self.target_boost_scale, 0.0, max_scale)
+            context_boost = torch.clamp(self.context_boost_scale, 0.0, max_scale)
+            background_suppress = torch.clamp(self.background_suppress_scale, 0.0, max_scale)
+            region_gain = (
+                1.0
+                + target_boost * target_mask
+                + context_boost * context_mask
+                - background_suppress * background_mask
+            )
+            region_gain = torch.clamp(region_gain, 1.0 - max_scale, 1.0 + max_scale)
+            region_delta = visual_features * (region_gain - 1.0)
+            guided_features = guided_features + region_delta
+
         residual_delta = None
         if self.feature_adapter is not None:
             residual_delta = self.gate_scale * target_mask * self.feature_adapter(visual_features)
@@ -349,19 +375,56 @@ class MaskGuidedVisualAdapter(nn.Module):
                 if spatial_delta is None
                 else spatial_delta.detach().float().pow(2).mean().sqrt()
             )
+            region_delta_rms = (
+                torch.zeros((), device=visual_features.device)
+                if region_delta is None
+                else region_delta.detach().float().pow(2).mean().sqrt()
+            )
             residual_delta_rms = (
                 torch.zeros((), device=visual_features.device)
                 if residual_delta is None
                 else residual_delta.detach().float().pow(2).mean().sqrt()
             )
+            target_boost_value = (
+                torch.zeros((), device=visual_features.device)
+                if self.target_boost_scale is None
+                else torch.clamp(self.target_boost_scale.detach(), 0.0, float(self.config.region_modulation_max))
+            )
+            context_boost_value = (
+                torch.zeros((), device=visual_features.device)
+                if self.context_boost_scale is None
+                else torch.clamp(self.context_boost_scale.detach(), 0.0, float(self.config.region_modulation_max))
+            )
+            background_suppress_value = (
+                torch.zeros((), device=visual_features.device)
+                if self.background_suppress_scale is None
+                else torch.clamp(self.background_suppress_scale.detach(), 0.0, float(self.config.region_modulation_max))
+            )
+            if region_gain is None:
+                region_gain_mean = torch.ones((), device=visual_features.device)
+                region_gain_min = torch.ones((), device=visual_features.device)
+                region_gain_max = torch.ones((), device=visual_features.device)
+            else:
+                region_gain_detached = region_gain.detach().float()
+                region_gain_mean = region_gain_detached.mean()
+                region_gain_min = region_gain_detached.amin()
+                region_gain_max = region_gain_detached.amax()
             self.latest_debug = {
                 "visual_rms": float(visual_rms.item()),
                 "spatial_delta_rms": float(spatial_delta_rms.item()),
                 "spatial_delta_ratio": float((spatial_delta_rms / visual_rms).item()),
+                "region_delta_rms": float(region_delta_rms.item()),
+                "region_delta_ratio": float((region_delta_rms / visual_rms).item()),
                 "residual_delta_rms": float(residual_delta_rms.item()),
                 "residual_delta_ratio": float((residual_delta_rms / visual_rms).item()),
                 "output_delta_rms": float(output_delta_rms.item()),
                 "output_delta_ratio": float((output_delta_rms / visual_rms).item()),
+                "target_boost_scale": float(target_boost_value.item()),
+                "context_boost_scale": float(context_boost_value.item()),
+                "background_suppress_scale": float(background_suppress_value.item()),
+                "region_gain_mean": float(region_gain_mean.item()),
+                "region_gain_min": float(region_gain_min.item()),
+                "region_gain_max": float(region_gain_max.item()),
                 "target_mask_mean": float(target_mask.detach().float().mean().item()),
                 "context_mask_mean": float(context_mask.detach().float().mean().item()),
                 "background_mask_mean": float(background_mask.detach().float().mean().item()),
