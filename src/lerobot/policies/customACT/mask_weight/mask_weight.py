@@ -87,6 +87,8 @@ def make_mask_guided_background_augmentation(
     masks: torch.Tensor,
     config: MaskWeightConfig,
     apply_mask: torch.Tensor | None = None,
+    min_strength_override: float | None = None,
+    max_strength_override: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Replace background pixels while preserving the YOLO target and context.
 
@@ -95,6 +97,8 @@ def make_mask_guided_background_augmentation(
         masks: YOLO soft masks shaped [B, 1, H, W] or resizable to image size.
         config: MaskWeightConfig with background augmentation parameters.
         apply_mask: Optional per-sample boolean mask shaped [B, 1, 1, 1].
+        min_strength_override: Optional lower bound for background replacement strength.
+        max_strength_override: Optional upper bound for background replacement strength.
 
     Returns:
         Augmented images and tensor debug metrics. Samples without a detected mask
@@ -169,8 +173,20 @@ def make_mask_guided_background_augmentation(
         ) < float(config.background_aug_noise_p)
         background = torch.where(use_noise, noise, random_color)
 
-    min_strength = float(config.background_aug_min_strength)
-    max_strength = float(config.background_aug_max_strength)
+    min_strength = (
+        float(config.background_aug_min_strength)
+        if min_strength_override is None
+        else float(min_strength_override)
+    )
+    max_strength = (
+        float(config.background_aug_max_strength)
+        if max_strength_override is None
+        else float(max_strength_override)
+    )
+    if not 0.0 <= min_strength <= 1.0 or not 0.0 <= max_strength <= 1.0:
+        raise ValueError("background augmentation strength bounds must be in [0, 1].")
+    if min_strength > max_strength:
+        raise ValueError("background augmentation min strength must be <= max strength.")
     strength = min_strength + torch.rand(
         batch_size,
         1,
@@ -195,6 +211,8 @@ def make_mask_guided_background_augmentation(
         "background_replaced_ratio": replaced.detach().float().mean(),
         "background_effective_change_ratio": effective_change.detach().float().mean(),
         "strength_mean": applied_strength.detach().float(),
+        "strength_min": torch.as_tensor(min_strength, dtype=images.dtype, device=images.device),
+        "strength_max": torch.as_tensor(max_strength, dtype=images.dtype, device=images.device),
         "image_delta_l1": (augmented.detach() - images.detach()).abs().float().mean(),
     }
     return augmented, debug

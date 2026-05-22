@@ -628,6 +628,13 @@ class ACT(nn.Module):
         batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
         skip_mask_weight_debug = bool(batch.get("_mask_weight_skip_debug", False))
         force_background_augmentation = bool(batch.get("_mask_weight_force_background_augmentation", False))
+        background_consistency_active = (
+            self.training
+            and self.config.use_mask_weight
+            and getattr(self.config.mw_config, "use_background_augmentation", False)
+            and getattr(self.config.mw_config, "use_background_consistency", False)
+            and getattr(self.config.mw_config, "background_consistency_loss_weight", 0.0) > 0.0
+        )
         if self.enable_debug_visualization and not skip_mask_weight_debug:
             self.latest_yolo_debug_overlays = {}
         if not skip_mask_weight_debug:
@@ -804,13 +811,19 @@ class ACT(nn.Module):
                         self.latest_mask_weight_debug[f"mask_weight/{cam_name}/mask_coverage"] = float(
                             (mask_for_debug > 0.05).float().mean().item()
                         )
+                        self.latest_mask_weight_debug[
+                            f"mask_weight/bg_aug/{cam_name}/random_suppressed_by_consistency"
+                        ] = float(background_consistency_active)
 
                     # 处理mask形状
                     if (
                         self.training
                         and getattr(self.config.mw_config, "use_background_augmentation", False)
                         and (
-                            getattr(self.config.mw_config, "background_aug_p", 0.0) > 0.0
+                            (
+                                getattr(self.config.mw_config, "background_aug_p", 0.0) > 0.0
+                                and not background_consistency_active
+                            )
                             or force_background_augmentation
                         )
                     ):
@@ -826,11 +839,26 @@ class ACT(nn.Module):
                                 dtype=torch.bool,
                                 device=img_01.device,
                             )
+                        min_strength_override = None
+                        max_strength_override = None
+                        if force_background_augmentation:
+                            min_strength_override = getattr(
+                                self.config.mw_config,
+                                "background_consistency_aug_min_strength",
+                                getattr(self.config.mw_config, "background_aug_min_strength", 0.3),
+                            )
+                            max_strength_override = getattr(
+                                self.config.mw_config,
+                                "background_consistency_aug_max_strength",
+                                getattr(self.config.mw_config, "background_aug_max_strength", 1.0),
+                            )
                         aug_img_01, bg_aug_debug = make_mask_guided_background_augmentation(
                             img_01,
                             yolo_mask,
                             self.config.mw_config,
                             apply_mask=apply_mask,
+                            min_strength_override=min_strength_override,
+                            max_strength_override=max_strength_override,
                         )
                         img = norm_step._apply_transform(
                             aug_img_01,

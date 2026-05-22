@@ -117,3 +117,28 @@ def test_mask_guided_background_augmentation_skips_samples_without_mask():
 
     assert torch.allclose(augmented, images)
     assert debug["applied_ratio"].item() == pytest.approx(0.0)
+
+
+def test_mask_guided_background_augmentation_strength_override():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        background_aug_p=1.0,
+        background_aug_context_dilation=0,
+        background_aug_keep_threshold=0.5,
+        background_aug_mode="random_color",
+    )
+    images = torch.zeros(2, 3, 4, 4)
+    masks = torch.zeros(2, 1, 4, 4)
+    masks[:, :, 1:3, 1:3] = 1.0
+
+    _, debug = make_mask_guided_background_augmentation(
+        images,
+        masks,
+        config,
+        min_strength_override=0.8,
+        max_strength_override=0.8,
+    )
+
+    assert debug["strength_min"].item() == pytest.approx(0.8)
+    assert debug["strength_max"].item() == pytest.approx(0.8)
+    assert debug["strength_mean"].item() == pytest.approx(0.8)
