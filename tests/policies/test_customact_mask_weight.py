@@ -71,6 +71,11 @@ def test_mask_guided_visual_adapter_region_modulation():
     assert guided_features[0, 0, 1, 1].item() == pytest.approx(1.2)
     assert guided_features[0, 0, 0, 0].item() == pytest.approx(0.8)
     assert adapter.latest_debug["region_delta_ratio"] > 0.0
+    assert adapter.latest_debug["target_background_rms_ratio_before"] == pytest.approx(1.0)
+    assert adapter.latest_debug["target_background_rms_ratio_after"] == pytest.approx(1.5)
+    assert adapter.latest_debug["target_background_rms_ratio_gain"] == pytest.approx(1.5)
+    assert adapter.latest_debug["target_delta_ratio"] == pytest.approx(0.2)
+    assert adapter.latest_debug["background_delta_ratio"] == pytest.approx(0.2)
 
 
 def test_mask_weight_config_rejects_invalid_mode():

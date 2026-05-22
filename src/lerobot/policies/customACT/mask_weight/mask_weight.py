@@ -367,9 +367,31 @@ class MaskGuidedVisualAdapter(nn.Module):
             return guided_features, target_tokens, target_pos_embed
 
         with torch.no_grad():
-            visual_rms = visual_features.detach().float().pow(2).mean().sqrt().clamp(min=1e-6)
-            output_delta = guided_features.detach() - visual_features.detach()
+            visual_float = visual_features.detach().float()
+            guided_float = guided_features.detach().float()
+
+            def _masked_rms(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+                weights_float = weights.detach().float()
+                weighted_energy = values.pow(2) * weights_float
+                denom = (weights_float.sum() * values.shape[1]).clamp(min=1e-6)
+                return (weighted_energy.sum() / denom).sqrt()
+
+            visual_rms = visual_float.pow(2).mean().sqrt().clamp(min=1e-6)
+            output_delta = guided_float - visual_float
             output_delta_rms = output_delta.float().pow(2).mean().sqrt()
+            input_target_rms = _masked_rms(visual_float, target_mask)
+            input_background_rms = _masked_rms(visual_float, background_mask)
+            output_target_rms = _masked_rms(guided_float, target_mask)
+            output_background_rms = _masked_rms(guided_float, background_mask)
+            target_background_ratio_before = input_target_rms / input_background_rms.clamp(min=1e-6)
+            target_background_ratio_after = output_target_rms / output_background_rms.clamp(min=1e-6)
+            target_background_ratio_gain = target_background_ratio_after / target_background_ratio_before.clamp(
+                min=1e-6
+            )
+            target_delta_ratio = _masked_rms(output_delta, target_mask) / input_target_rms.clamp(min=1e-6)
+            background_delta_ratio = _masked_rms(output_delta, background_mask) / input_background_rms.clamp(
+                min=1e-6
+            )
             spatial_delta_rms = (
                 torch.zeros((), device=visual_features.device)
                 if spatial_delta is None
@@ -419,6 +441,15 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "residual_delta_ratio": float((residual_delta_rms / visual_rms).item()),
                 "output_delta_rms": float(output_delta_rms.item()),
                 "output_delta_ratio": float((output_delta_rms / visual_rms).item()),
+                "input_target_rms": float(input_target_rms.item()),
+                "input_background_rms": float(input_background_rms.item()),
+                "output_target_rms": float(output_target_rms.item()),
+                "output_background_rms": float(output_background_rms.item()),
+                "target_background_rms_ratio_before": float(target_background_ratio_before.item()),
+                "target_background_rms_ratio_after": float(target_background_ratio_after.item()),
+                "target_background_rms_ratio_gain": float(target_background_ratio_gain.item()),
+                "target_delta_ratio": float(target_delta_ratio.item()),
+                "background_delta_ratio": float(background_delta_ratio.item()),
                 "target_boost_scale": float(target_boost_value.item()),
                 "context_boost_scale": float(context_boost_value.item()),
                 "background_suppress_scale": float(background_suppress_value.item()),
