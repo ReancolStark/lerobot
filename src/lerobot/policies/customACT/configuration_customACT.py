@@ -20,16 +20,17 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.policies.customACT.history_obs_state.configuration_history_obs import HistoryObsConfig, HistoryLSTMConfig, HistoryConv1dConfig
 from lerobot.policies.customACT.key_history_state.configuration_key_history import KeyHistoryTokenConfig
+from lerobot.policies.customACT.history_token_replan_score.configuration_history_token_replan_score import (
+    HistoryTokenReplanScoreConfig,
+)
 from lerobot.policies.customACT.model_adaptive_chunk.configuration_model_adaptive_chunk import (
     HistoryTokenAdaptiveChunkingConfig,
 )
-from lerobot.policies.customACT.recovery_adaptive_chunking.configuration_recovery_adaptive_chunking import (
-    HistoryTokenReplanScoreConfig,
-    RecoveryAdaptiveChunkingConfig,
-)
 from lerobot.policies.customACT.segment_understanding.configuration_segment_understanding import SegmentUnderstandingConfig
 
-AdaptiveActionChunkingConfig = RecoveryAdaptiveChunkingConfig
+ThreeRegimeAdaptiveChunkingConfig = HistoryTokenReplanScoreConfig
+AdaptiveActionChunkingConfig = ThreeRegimeAdaptiveChunkingConfig
+RecoveryAdaptiveChunkingConfig = HistoryTokenReplanScoreConfig
 
 @PreTrainedConfig.register_subclass("customACT")
 @dataclass
@@ -101,21 +102,20 @@ class ACTConfig(PreTrainedConfig):
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
     """
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-    # recovery_token+自适应动作块统一配置。
     # Unified config for the history-token branch and replan-score training.
     # Existing legacy top-level fields remain supported; __post_init__ syncs them
     # into this nested config when use_history_token_replan_score_config is False.
     history_token_replan_score: HistoryTokenReplanScoreConfig = field(
         default_factory=HistoryTokenReplanScoreConfig
     )
-    # False keeps legacy top-level fields as the source of truth. Set True for new
-    # experiments that configure history-token + replan-score only through the nested config.
-    # history_token+自适应chunk创新点要一直开着
+
+    # True means the nested history_token_replan_score config is the source of truth.
+    # False converts legacy top-level fields into that nested config.
     use_history_token_replan_score_config: bool = True
 
     # Total switch for the proposed innovation: history tokens produce a replan
     # score, then adaptive chunking decides how many predicted actions to execute.
-    use_history_token_adaptive_chunking: bool = False
+    use_history_token_adaptive_chunking: bool = True
 
     # 是否开启计算状态平滑度指标（state smoothness），用于评估动作块内状态变化的平滑程度。这个指标可以帮助分析自适应动作块的效果，尤其是在运动突变发生时状态的变化情况。
     compute_state_smoothness: bool = True
@@ -154,35 +154,38 @@ class ACTConfig(PreTrainedConfig):
 
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-    # 是否启用新的“失败感知本体历史 Recovery Token 模块”。
-    # False：完全走原始 ACT 路径，不需要历史 state/action 字段。
-    # True：训练时数据集自动构造 observation.state.history、action.history、history_mask；
-    #       推理时 policy 内部维护 state/action 历史 buffer。
+    # Active flag for the history-token + replan-score branch.
+    # Training batches provide observation.state.history/action.history/history_mask;
+    # online inference maintains those history buffers inside the policy.
+    use_history_token_replan_score: bool = False
+    # Legacy alias kept so old config files can still be loaded.
     use_recovery_history_token: bool = False
-    # Recovery 模块使用的历史窗口长度 H。
+    # History-token window length H.
     # state.history = [s_{t-H+1}, ..., s_t]，action.history = [a_{t-H}, ..., a_{t-1}]。
     history_len: int = 64
-    # 把 H 个历史时刻压缩成多少个 recovery tokens。4 表示输出 [B, 4, dim_model]。
+    # Number of history tokens produced from the H-step history window.
     # 如果 history_len 不能整除该值，最后一段会自动包含剩余历史帧。
     history_num_segments: int = 4
-    # Recovery 模块内部因果卷积的隐藏维度。只影响新增历史模块，不改变 ACT 主干 dim_model。
+    # Hidden size used inside the history-token causal-convolution branch.
     history_hidden_dim: int = 256
     # 因果卷积核大小。3 表示每层卷积最多看当前和左侧两个位置，再由 dilation 扩大感受野。
     history_conv_kernel_size: int = 3
     # 多层膨胀因果卷积的 dilation 设置。[1, 2, 4, 8] 能覆盖短期到较长期的历史变化。
     # 所有卷积都只做左侧 padding，保证不会泄露未来信息。
     history_conv_dilations: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
-    # Recovery 模块内部 dropout，用于减少小数据集上历史 token 的过拟合。
+    # Dropout inside the history-token branch.
     history_dropout: float = 0.1
     # 是否使用动作-状态执行偏差 exec_error = projected_action - state。
     # True：让模块显式感知“动作发出后状态没有按预期变化”的失败线索。
     # False：exec_error 置零，只使用相对位移、速度和加速度。
     use_action_state_error: bool = True
-    # 历史动作预测辅助损失权重。目标是 batch["action"][:, 0, :]，用于让 recovery token 保留动作相关信息。
+    # Auxiliary action loss for keeping history tokens action-relevant.
     history_action_loss_weight: float = 0.05
     # 事件先验对齐辅助损失权重。该损失把 learned event score 弱约束到运动突变先验附近，不使用人工阶段标签。
     event_prior_loss_weight: float = 0.01
-    # Recovery tokens 的位置编码类型。目前只实现 "learned"，即每个 recovery segment 一个可学习位置向量。
+    # Positional embedding type for history tokens. Currently only "learned".
+    history_token_pos_embed: str = "learned"
+    # Legacy alias kept so old config files can still be loaded.
     recovery_token_pos_embed: str = "learned"
 
 
@@ -218,7 +221,11 @@ class ACTConfig(PreTrainedConfig):
     # 自适应动作块配置（Adaptive Action Chunking Config）。
     # 是否启用推理阶段的历史感知自适应动作块。False 时保持原始 ACT 固定执行长度。
     use_adaptive_action_chunking: bool = False
-    # 自适应动作块的详细配置，包括 chunk 长度阈值、历史状态阈值、动态加权和调试输出。
+    # Detailed config for the older stable/nominal/unstable controller.
+    three_regime_adaptive_chunking: ThreeRegimeAdaptiveChunkingConfig = field(
+        default_factory=ThreeRegimeAdaptiveChunkingConfig
+    )
+    # Legacy alias for the older stable/nominal/unstable controller config.
     adaptive_action_chunking: AdaptiveActionChunkingConfig = field(
         default_factory=AdaptiveActionChunkingConfig
     )
@@ -306,6 +313,7 @@ class ACTConfig(PreTrainedConfig):
             self._apply_history_token_replan_score_config()
         else:
             self.history_token_replan_score = self.get_history_token_replan_score_config()
+            self._apply_history_token_replan_score_config()
 
         """Input validation (not exhaustive)."""
         # if not self.vision_backbone.startswith("resnet"):
@@ -326,14 +334,14 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-        if self.use_recovery_history_token and self.use_key_history_token:
+        if self.use_history_token_replan_score and self.use_key_history_token:
             raise ValueError(
-                "`use_recovery_history_token` and `use_key_history_token` cannot both be enabled. "
-                "Disable recovery history when running the no-failure key-history experiment."
+                "`use_history_token_replan_score` and `use_key_history_token` cannot both be enabled. "
+                "Disable history-token replan scoring when running the no-failure key-history experiment."
             )
-        if self.use_recovery_history_token:
+        if self.use_history_token_replan_score:
             if self.history_len <= 0:
-                raise ValueError("`history_len` must be positive when recovery history token is enabled.")
+                raise ValueError("`history_len` must be positive when history-token replan scoring is enabled.")
             if self.history_num_segments <= 0:
                 raise ValueError("`history_num_segments` must be positive.")
             if self.history_len < self.history_num_segments:
@@ -344,8 +352,8 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError("`history_conv_kernel_size` must be positive.")
             if not self.history_conv_dilations:
                 raise ValueError("`history_conv_dilations` cannot be empty.")
-            if self.recovery_token_pos_embed != "learned":
-                raise ValueError("Only `recovery_token_pos_embed='learned'` is currently supported.")
+            if self.history_token_pos_embed != "learned":
+                raise ValueError("Only `history_token_pos_embed='learned'` is currently supported.")
         if self.use_key_history_token:
             if self.key_history_len <= 0:
                 raise ValueError("`key_history_len` must be positive when key history token is enabled.")
@@ -364,31 +372,31 @@ class ACTConfig(PreTrainedConfig):
             if self.key_history_token_pos_embed != "learned":
                 raise ValueError("Only `key_history_token_pos_embed='learned'` is currently supported.")
         if self.use_adaptive_action_chunking:
-            aac = self.adaptive_action_chunking
+            aac = self.three_regime_adaptive_chunking
             if aac.state_history_len < 2:
-                raise ValueError("`adaptive_action_chunking.state_history_len` must be >= 2.")
+                raise ValueError("`three_regime_adaptive_chunking.state_history_len` must be >= 2.")
             if aac.min_chunk_size <= 0:
-                raise ValueError("`adaptive_action_chunking.min_chunk_size` must be positive.")
+                raise ValueError("`three_regime_adaptive_chunking.min_chunk_size` must be positive.")
             if aac.max_chunk_size < 0:
-                raise ValueError("`adaptive_action_chunking.max_chunk_size` cannot be negative.")
+                raise ValueError("`three_regime_adaptive_chunking.max_chunk_size` cannot be negative.")
             if aac.max_chunk_size and aac.max_chunk_size < aac.min_chunk_size:
                 raise ValueError(
-                    "`adaptive_action_chunking.max_chunk_size` must be >= min_chunk_size when set."
+                    "`three_regime_adaptive_chunking.max_chunk_size` must be >= min_chunk_size when set."
                 )
             if aac.stable_chunk_multiplier <= 0 or aac.unstable_chunk_multiplier <= 0:
                 raise ValueError("Adaptive chunk multipliers must be positive.")
             if aac.volatility_low < 0 or aac.volatility_high < 0 or aac.acceleration_high < 0:
                 raise ValueError("Adaptive chunk motion thresholds cannot be negative.")
             if aac.volatility_low > aac.volatility_high:
-                raise ValueError("`adaptive_action_chunking.volatility_low` must be <= volatility_high.")
+                raise ValueError("`three_regime_adaptive_chunking.volatility_low` must be <= volatility_high.")
             if aac.action_uncertainty_low < 0 or aac.action_uncertainty_high < 0:
                 raise ValueError("Adaptive chunk action uncertainty thresholds cannot be negative.")
             if aac.action_uncertainty_low > aac.action_uncertainty_high:
                 raise ValueError(
-                    "`adaptive_action_chunking.action_uncertainty_low` must be <= action_uncertainty_high."
+                    "`three_regime_adaptive_chunking.action_uncertainty_low` must be <= action_uncertainty_high."
                 )
             if aac.debug_print_every <= 0:
-                raise ValueError("`adaptive_action_chunking.debug_print_every` must be positive.")
+                raise ValueError("`three_regime_adaptive_chunking.debug_print_every` must be positive.")
             if aac.debug_print_num_actions < 0 or aac.debug_print_action_dims < 0:
                 raise ValueError("Adaptive chunk debug preview sizes cannot be negative.")
         if self.use_history_token_adaptive_chunking:
@@ -409,7 +417,7 @@ class ACTConfig(PreTrainedConfig):
                     "history_token_adaptive_chunking.mode='three_regime'."
                 )
             if (
-                not self.use_recovery_history_token
+                not self.use_history_token_replan_score
                 and self.history_token_adaptive_chunking.fallback_replan_score is None
             ):
                 raise ValueError(
@@ -431,8 +439,8 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
-        if self.use_recovery_history_token and not self.robot_state_feature:
-            raise ValueError("`observation.state` is required when recovery history token is enabled.")
+        if self.use_history_token_replan_score and not self.robot_state_feature:
+            raise ValueError("`observation.state` is required when history-token replan scoring is enabled.")
 
     def get_HistoryObsConfig(self) -> HistoryObsConfig:
         if self.ho_type == 'lstm':
@@ -472,7 +480,8 @@ class ACTConfig(PreTrainedConfig):
 
     def _apply_history_token_replan_score_config(self) -> None:
         rac = self.history_token_replan_score
-        self.use_recovery_history_token = rac.enabled and rac.use_history_token
+        self.use_history_token_replan_score = rac.enabled and rac.use_history_token
+        self.use_recovery_history_token = self.use_history_token_replan_score
         self.use_adaptive_action_chunking = (
             rac.enabled
             and rac.use_adaptive_action_chunking
@@ -491,6 +500,7 @@ class ACTConfig(PreTrainedConfig):
         self.use_action_state_error = rac.use_action_state_error
         self.history_action_loss_weight = rac.action_loss_weight
         self.event_prior_loss_weight = rac.event_prior_loss_weight
+        self.history_token_pos_embed = rac.token_pos_embed
         self.recovery_token_pos_embed = rac.token_pos_embed
         for name in (
             "state_history_len",
@@ -519,6 +529,7 @@ class ACTConfig(PreTrainedConfig):
             "debug_print_num_actions",
             "debug_print_action_dims",
         ):
+            setattr(self.three_regime_adaptive_chunking, name, getattr(rac, name))
             setattr(self.adaptive_action_chunking, name, getattr(rac, name))
 
     @property
@@ -534,12 +545,20 @@ class ACTConfig(PreTrainedConfig):
         return list(range(-self.n_history_obs_states+1, 1)) if( self.n_history_obs_states > 0 ) else None 
 
     @property
+    def history_token_state_history_delta_indices(self) -> list | None:
+        return list(range(-self.history_len + 1, 1)) if self.use_history_token_replan_score else None
+
+    @property
+    def history_token_action_history_delta_indices(self) -> list | None:
+        return list(range(-self.history_len, 0)) if self.use_history_token_replan_score else None
+
+    @property
     def recovery_state_history_delta_indices(self) -> list | None:
-        return list(range(-self.history_len + 1, 1)) if self.use_recovery_history_token else None
+        return self.history_token_state_history_delta_indices
 
     @property
     def recovery_action_history_delta_indices(self) -> list | None:
-        return list(range(-self.history_len, 0)) if self.use_recovery_history_token else None
+        return self.history_token_action_history_delta_indices
 
     @property
     def key_state_history_delta_indices(self) -> list | None:

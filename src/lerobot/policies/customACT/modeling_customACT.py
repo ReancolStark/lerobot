@@ -51,13 +51,13 @@ from lerobot.utils.constants import (
 )
 #新增：自己的import
 from lerobot.policies.customACT.history_obs_state.modeling_history_obs import HistoryObsStateEmbedding
+from lerobot.policies.customACT.history_token_replan_score import (
+    HistoryTokenReplanScoreModel,
+    ThreeRegimeAdaptiveChunkingController,
+    compute_replan_score_loss,
+)
 from lerobot.policies.customACT.key_history_state.modeling_key_history import KeyHistoryTokenEncoder
 from lerobot.policies.customACT.model_adaptive_chunk import ReplanScoreAdaptiveChunkingController
-from lerobot.policies.customACT.recovery_adaptive_chunking import (
-    RecoveryAdaptiveChunkingController,
-    RecoveryAdaptiveChunkingModel,
-    compute_recovery_score_loss,
-)
 from lerobot.policies.dino_act.backbone_res import ResNet18Backbone, get_custom_backbone
 from lerobot.policies.dino_act.convnext import ConvNeXtBackbone
 from lerobot.policies.dino_act.convnext_frame import ConvNeXtBackbone1
@@ -98,9 +98,9 @@ class ACTPolicy(PreTrainedPolicy):
         if config.temporal_ensemble_coeff is not None:
             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
 
-        self.adaptive_action_chunker = None
+        self.three_regime_adaptive_chunker = None
         if config.use_adaptive_action_chunking:
-            self.adaptive_action_chunker = RecoveryAdaptiveChunkingController(
+            self.three_regime_adaptive_chunker = ThreeRegimeAdaptiveChunkingController(
                 config.history_token_replan_score,
                 policy_chunk_size=config.chunk_size,
                 policy_n_action_steps=(
@@ -124,24 +124,24 @@ class ACTPolicy(PreTrainedPolicy):
     @classmethod
     def _load_as_safetensor(cls, model: "ACTPolicy", model_file: str, map_location: str, strict: bool) -> "ACTPolicy":
         state_dict = load_safetensor_file(model_file, device=map_location)
-        state_dict = cls._remap_legacy_recovery_state_dict_keys(model, state_dict)
+        state_dict = cls._remap_legacy_history_token_state_dict_keys(model, state_dict)
         missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=strict)
         log_model_loading_keys(missing_keys, unexpected_keys)
         return model
 
     @staticmethod
-    def _remap_legacy_recovery_state_dict_keys(
+    def _remap_legacy_history_token_state_dict_keys(
         model: "ACTPolicy",
         state_dict: dict[str, Tensor],
     ) -> dict[str, Tensor]:
-        """Load recovery checkpoints saved before the module rename.
+        """Load history-token checkpoints saved before the module rename.
 
-        Older experiments saved the same recovery encoder under
+        Older experiments saved the same history encoder under
         ``model.recovery_history_encoder`` with a standalone
-        ``model.recovery_token_pos_embed`` parameter. The current code keeps the
-        encoder and adaptive controller under
-        ``model.recovery_adaptive_chunking_model``. Without this remap the
-        recovery score head is silently left randomly initialized when
+        ``model.recovery_token_pos_embed`` parameter, and later under
+        ``model.recovery_adaptive_chunking_model``. The current code calls the
+        branch ``model.history_token_replan_score_model``. Without this remap
+        the replan-score head is silently left randomly initialized when
         ``strict=False`` is used for inference.
         """
         target_state = model.state_dict()
@@ -153,11 +153,20 @@ class ACTPolicy(PreTrainedPolicy):
             if key.startswith("model.recovery_history_encoder."):
                 new_key = key.replace(
                     "model.recovery_history_encoder.",
+                    "model.history_token_replan_score_model.",
+                    1,
+                )
+            elif key.startswith("model.recovery_adaptive_chunking_model."):
+                new_key = key.replace(
                     "model.recovery_adaptive_chunking_model.",
+                    "model.history_token_replan_score_model.",
                     1,
                 )
             elif key == "model.recovery_token_pos_embed":
-                new_key = "model.recovery_adaptive_chunking_model.token_pos_embed"
+                new_key = "model.history_token_replan_score_model.token_pos_embed"
+
+            if ".recovery_score_head." in new_key:
+                new_key = new_key.replace(".recovery_score_head.", ".replan_score_head.")
 
             if new_key != key and new_key in target_state:
                 if tuple(target_state[new_key].shape) == tuple(value.shape):
@@ -165,7 +174,7 @@ class ACTPolicy(PreTrainedPolicy):
                     remapped_count += 1
                     continue
                 logging.warning(
-                    "Skipping legacy recovery checkpoint key remap %s -> %s due to shape mismatch: %s vs %s",
+                    "Skipping legacy history-token checkpoint key remap %s -> %s due to shape mismatch: %s vs %s",
                     key,
                     new_key,
                     tuple(value.shape),
@@ -175,7 +184,7 @@ class ACTPolicy(PreTrainedPolicy):
             remapped[key] = value
 
         if remapped_count:
-            logging.info("Remapped %s legacy recovery checkpoint key(s).", remapped_count)
+            logging.info("Remapped %s legacy history-token checkpoint key(s).", remapped_count)
         return remapped
 
     def get_optim_params(self) -> dict:
@@ -205,17 +214,17 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
-        if self.adaptive_action_chunker is not None:
-            self.adaptive_action_chunker.reset()
+        if self.three_regime_adaptive_chunker is not None:
+            self.three_regime_adaptive_chunker.reset()
         if self.replan_score_adaptive_chunker is not None:
             self.replan_score_adaptive_chunker.reset()
-        if self.config.use_recovery_history_token:
-            self._recovery_state_buffer = deque([], maxlen=self.config.history_len)
-            self._recovery_action_buffer = deque([], maxlen=self.config.history_len)
+        if self.config.use_history_token_replan_score:
+            self._history_state_buffer = deque([], maxlen=self.config.history_len)
+            self._history_action_buffer = deque([], maxlen=self.config.history_len)
         if self.config.use_key_history_token:
             self._key_history_state_buffer = deque([], maxlen=self.config.key_history_len)
 
-    def _record_recovery_state(self, batch: dict[str, Tensor]) -> None:
+    def _record_history_token_state(self, batch: dict[str, Tensor]) -> None:
         """Record the current normalized proprioceptive state for online inference.
 
         During training, the dataloader provides ``observation.state.history`` directly.
@@ -223,13 +232,13 @@ class ACTPolicy(PreTrainedPolicy):
         small FIFO buffer here. The stored tensor is [state_dim] and is already normalized
         by the policy preprocessor, matching the training-time state history scale.
         """
-        if not self.config.use_recovery_history_token or OBS_STATE_HISTORY in batch:
+        if not self.config.use_history_token_replan_score or OBS_STATE_HISTORY in batch:
             return
         state = batch[OBS_STATE].detach()
         if state.ndim == 1:
             state = state.unsqueeze(0)
-        assert state.shape[0] == 1, "Online recovery history buffer currently supports batch size 1."
-        self._recovery_state_buffer.append(state[0])
+        assert state.shape[0] == 1, "Online history-token buffer currently supports batch size 1."
+        self._history_state_buffer.append(state[0])
 
     def _record_key_history_state(self, batch: dict[str, Tensor]) -> None:
         """Record current normalized state for online key-history inference."""
@@ -241,21 +250,21 @@ class ACTPolicy(PreTrainedPolicy):
         assert state.shape[0] == 1, "Online key history buffer currently supports batch size 1."
         self._key_history_state_buffer.append(state[0])
 
-    def _record_recovery_action(self, action: Tensor) -> None:
+    def _record_history_token_action(self, action: Tensor) -> None:
         """Record the normalized action selected at this control step.
 
-        The recovery encoder expects ``action.history = [a_{t-H}, ..., a_{t-1}]``.
+        The history-token branch expects ``action.history = [a_{t-H}, ..., a_{t-1}]``.
         We therefore append the action only after it has been selected from the chunk or
         temporal ensemble. This keeps the next model call causal: it can see actions that
         were already issued, but never future actions from the current predicted chunk.
         """
-        if not self.config.use_recovery_history_token:
+        if not self.config.use_history_token_replan_score:
             return
         action = action.detach()
         if action.ndim == 1:
             action = action.unsqueeze(0)
-        assert action.shape[0] == 1, "Online recovery action buffer currently supports batch size 1."
-        self._recovery_action_buffer.append(action[0])
+        assert action.shape[0] == 1, "Online history-token action buffer currently supports batch size 1."
+        self._history_action_buffer.append(action[0])
 
     def _left_pad_history(
         self,
@@ -287,8 +296,8 @@ class ACTPolicy(PreTrainedPolicy):
             mask[-valid_len:] = True
         return padded, mask
 
-    def _add_recovery_history_to_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Attach recovery history fields to an online inference batch.
+    def _add_history_token_inputs_to_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Attach history-token fields to an online inference batch.
 
         Training batches get these fields from dataset delta timestamps. In deployment,
         this method builds:
@@ -300,23 +309,23 @@ class ACTPolicy(PreTrainedPolicy):
         position, so the first few control steps do not pretend that padded actions are
         valid evidence.
         """
-        if not self.config.use_recovery_history_token or OBS_STATE_HISTORY in batch:
+        if not self.config.use_history_token_replan_score or OBS_STATE_HISTORY in batch:
             return batch
-        if len(self._recovery_state_buffer) == 0:
-            self._record_recovery_state(batch)
+        if len(self._history_state_buffer) == 0:
+            self._record_history_token_state(batch)
 
         batch = dict(batch)
         current_state = batch[OBS_STATE]
         if current_state.ndim == 1:
             current_state = current_state.unsqueeze(0)
-        assert current_state.shape[0] == 1, "Online recovery history buffer currently supports batch size 1."
+        assert current_state.shape[0] == 1, "Online history-token buffer currently supports batch size 1."
 
-        state_pad_value = self._recovery_state_buffer[0].view(1, -1).to(current_state.device)
+        state_pad_value = self._history_state_buffer[0].view(1, -1).to(current_state.device)
         action_dim = self.config.action_feature.shape[0]
         action_pad_value = torch.zeros(1, action_dim, dtype=current_state.dtype, device=current_state.device)
 
-        state_values = [v.to(current_state.device, dtype=current_state.dtype) for v in self._recovery_state_buffer]
-        action_values = [v.to(current_state.device, dtype=current_state.dtype) for v in self._recovery_action_buffer]
+        state_values = [v.to(current_state.device, dtype=current_state.dtype) for v in self._history_state_buffer]
+        action_values = [v.to(current_state.device, dtype=current_state.dtype) for v in self._history_action_buffer]
         state_history, state_mask = self._left_pad_history(
             state_values, target_len=self.config.history_len, pad_value=state_pad_value
         )
@@ -363,28 +372,31 @@ class ACTPolicy(PreTrainedPolicy):
         return batch
 
     def _observe_adaptive_action_chunking_state(self, batch: dict[str, Tensor]) -> None:
-        if self.adaptive_action_chunker is None:
+        if self.three_regime_adaptive_chunker is None:
             return
-        self.adaptive_action_chunker.observe_state(batch.get(OBS_STATE))
+        self.three_regime_adaptive_chunker.observe_state(batch.get(OBS_STATE))
 
     def prepare_online_inference_step(self, batch: dict[str, Tensor]) -> None:
         """Update online history buffers before a policy inference call."""
-        self._record_recovery_state(batch)
+        self._record_history_token_state(batch)
         self._record_key_history_state(batch)
         self._observe_adaptive_action_chunking_state(batch)
 
-    def _get_recovery_score_for_adaptive_action_chunking(self) -> float | None:
-        recovery_aux_outputs = getattr(self.model, "recovery_aux_outputs", None)
-        if not recovery_aux_outputs or "recovery_score" not in recovery_aux_outputs:
+    def _get_replan_score_for_adaptive_action_chunking(self) -> float | None:
+        replan_aux_outputs = getattr(self.model, "replan_aux_outputs", None)
+        if not replan_aux_outputs:
             return None
-        return float(recovery_aux_outputs["recovery_score"].detach().mean().item())
+        replan_score = replan_aux_outputs.get("replan_score", replan_aux_outputs.get("recovery_score"))
+        if replan_score is None:
+            return None
+        return float(replan_score.detach().mean().item())
 
-    def _decide_adaptive_action_chunking(self, actions: Tensor):
-        if self.adaptive_action_chunker is None:
+    def _decide_three_regime_adaptive_action_chunking(self, actions: Tensor):
+        if self.three_regime_adaptive_chunker is None:
             return None
-        return self.adaptive_action_chunker.decide(
+        return self.three_regime_adaptive_chunker.decide(
             actions,
-            recovery_score=self._get_recovery_score_for_adaptive_action_chunking(),
+            replan_score=self._get_replan_score_for_adaptive_action_chunking(),
         )
 
     def _adapt_action_chunk_with_replan_score(
@@ -397,7 +409,7 @@ class ACTPolicy(PreTrainedPolicy):
             raise RuntimeError("Replan-score adaptive chunker is not enabled.")
 
         decision = self.replan_score_adaptive_chunker.decide(
-            replan_score=self._get_recovery_score_for_adaptive_action_chunking(),
+            replan_score=self._get_replan_score_for_adaptive_action_chunking(),
             available_actions=actions.shape[1],
             max_actions_per_chunk=max_actions_per_chunk,
         )
@@ -423,18 +435,18 @@ class ACTPolicy(PreTrainedPolicy):
                 max_actions_per_chunk=max_actions_per_chunk,
             )
 
-        if self.adaptive_action_chunker is None:
+        if self.three_regime_adaptive_chunker is None:
             if max_actions_per_chunk is None:
                 max_actions_per_chunk = self.config.n_action_steps
             return actions[:, :max_actions_per_chunk]
 
-        decision = self._decide_adaptive_action_chunking(actions)
+        decision = self._decide_three_regime_adaptive_action_chunking(actions)
         chunk_size = decision.chunk_size
         if max_actions_per_chunk is not None:
             chunk_size = min(chunk_size, max_actions_per_chunk)
         selected_actions = actions[:, :chunk_size]
-        selected_actions = self.adaptive_action_chunker.smooth_chunk_transition(selected_actions)
-        self.adaptive_action_chunker.debug_prediction(
+        selected_actions = self.three_regime_adaptive_chunker.smooth_chunk_transition(selected_actions)
+        self.three_regime_adaptive_chunker.debug_prediction(
             predicted_actions=actions,
             executed_actions=selected_actions,
             decision=decision,
@@ -456,13 +468,13 @@ class ACTPolicy(PreTrainedPolicy):
 
         if self.config.temporal_ensemble_coeff is not None:
             actions = self.predict_action_chunk(batch)
-            decision = self._decide_adaptive_action_chunking(actions)
+            decision = self._decide_three_regime_adaptive_action_chunking(actions)
             if decision is not None:
-                action = self.adaptive_action_chunker.update_temporal_ensemble(
+                action = self.three_regime_adaptive_chunker.update_temporal_ensemble(
                     actions,
                     old_action_weight=decision.old_action_weight,
                 )
-                self.adaptive_action_chunker.debug_prediction(
+                self.three_regime_adaptive_chunker.debug_prediction(
                     predicted_actions=actions,
                     executed_actions=actions[:, :1],
                     decision=decision,
@@ -470,18 +482,18 @@ class ACTPolicy(PreTrainedPolicy):
                 )
                 remaining = (
                     0
-                    if self.adaptive_action_chunker.ensembled_actions is None
-                    else self.adaptive_action_chunker.ensembled_actions.shape[1]
+                    if self.three_regime_adaptive_chunker.ensembled_actions is None
+                    else self.three_regime_adaptive_chunker.ensembled_actions.shape[1]
                 )
-                self.adaptive_action_chunker.debug_execution(
+                self.three_regime_adaptive_chunker.debug_execution(
                     action=action,
                     remaining_actions=remaining,
                     source="temporal_ensemble",
                 )
-                self.adaptive_action_chunker.observe_executed_action(action)
+                self.three_regime_adaptive_chunker.observe_executed_action(action)
             else:
                 action = self.temporal_ensembler.update(actions)
-            self._record_recovery_action(action)
+            self._record_history_token_action(action)
             return action
 
         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
@@ -494,20 +506,20 @@ class ACTPolicy(PreTrainedPolicy):
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
         action = self._action_queue.popleft()
-        if self.adaptive_action_chunker is not None:
-            self.adaptive_action_chunker.debug_execution(
+        if self.three_regime_adaptive_chunker is not None:
+            self.three_regime_adaptive_chunker.debug_execution(
                 action=action,
                 remaining_actions=len(self._action_queue),
                 source="select_action",
             )
-            self.adaptive_action_chunker.observe_executed_action(action)
+            self.three_regime_adaptive_chunker.observe_executed_action(action)
         elif self.replan_score_adaptive_chunker is not None:
             self.replan_score_adaptive_chunker.debug_execution(
                 action=action,
                 remaining_actions=len(self._action_queue),
                 source="select_action",
             )
-        self._record_recovery_action(action)
+        self._record_history_token_action(action)
         return action
 
     @torch.no_grad()
@@ -518,7 +530,7 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
-        batch = self._add_recovery_history_to_batch(batch)
+        batch = self._add_history_token_inputs_to_batch(batch)
         batch = self._add_key_history_to_batch(batch)
 
         actions = self.model(batch)[0]
@@ -568,14 +580,14 @@ class ACTPolicy(PreTrainedPolicy):
             loss_dict["history_aux_action_loss"] = history_aux_action_loss.item()
             loss_dict["history_aux_loss_weight"] = self.config.ho_aux_loss_weight
 
-        recovery_aux_outputs = getattr(self.model, "recovery_aux_outputs", None)
-        if self.config.use_recovery_history_token and recovery_aux_outputs is not None:
-            # Auxiliary target 1: from the recovery tokens alone, predict the first action
+        replan_aux_outputs = getattr(self.model, "replan_aux_outputs", None)
+        if self.config.use_history_token_replan_score and replan_aux_outputs is not None:
+            # Auxiliary target 1: from the history tokens alone, predict the first action
             # in the supervised ACT chunk, i.e. batch["action"][:, 0, :].
             first_action_mask = (~batch["action_is_pad"][:, 0]).unsqueeze(-1).to(dtype=batch[ACTION].dtype)
             hist_action_loss = (
                 F.mse_loss(
-                    recovery_aux_outputs["hist_action_pred"],
+                    replan_aux_outputs["hist_action_pred"],
                     batch[ACTION][:, 0],
                     reduction="none",
                 )
@@ -585,11 +597,11 @@ class ACTPolicy(PreTrainedPolicy):
             # Auxiliary target 2: keep the learned event score weakly aligned with a
             # no-label motion-change prior. This does not introduce manual phase labels;
             # it only says that large velocity/acceleration/execution-error moments are
-            # plausible recovery-relevant events.
+            # plausible replan-relevant events.
             history_mask = batch[HISTORY_MASK].to(dtype=torch.bool)
             valid = history_mask.to(dtype=batch[ACTION].dtype)
-            event_prior = recovery_aux_outputs["event_prior"]
-            event_scores = recovery_aux_outputs["event_scores"]
+            event_prior = replan_aux_outputs["event_prior"]
+            event_scores = replan_aux_outputs["event_scores"]
             denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
             prior_mean = (event_prior * valid).sum(dim=1, keepdim=True) / denom
             prior_var = (((event_prior - prior_mean) * valid) ** 2).sum(dim=1, keepdim=True) / denom
@@ -605,15 +617,15 @@ class ACTPolicy(PreTrainedPolicy):
             )
             loss_dict["hist_action_loss"] = hist_action_loss.item()
             loss_dict["event_prior_loss"] = event_prior_loss.item()
-            loss_dict["recovery_score_mean"] = recovery_aux_outputs["recovery_score"].mean().item()
+            loss_dict["replan_score_mean"] = replan_aux_outputs["replan_score"].mean().item()
             if history_mask.any():
                 loss_dict["event_score_mean"] = event_scores[history_mask].mean().item()
             else:
                 loss_dict["event_score_mean"] = 0.0
 
             if self.config.history_token_replan_score.replan_score_loss_weight > 0:
-                recovery_score_loss, recovery_target_info = compute_recovery_score_loss(
-                    recovery_score=recovery_aux_outputs["recovery_score"],
+                replan_score_loss, replan_target_info = compute_replan_score_loss(
+                    replan_score=replan_aux_outputs["replan_score"],
                     state_history=batch[OBS_STATE_HISTORY],
                     action_history=batch[ACTION_HISTORY],
                     future_actions=batch[ACTION],
@@ -624,13 +636,13 @@ class ACTPolicy(PreTrainedPolicy):
                 loss = (
                     loss
                     + self.config.history_token_replan_score.replan_score_loss_weight
-                    * recovery_score_loss
+                    * replan_score_loss
                 )
-                loss_dict["recovery_score_loss"] = recovery_score_loss.item()
-                loss_dict["recovery_target_mean"] = recovery_target_info["target"].mean().item()
-                loss_dict["recovery_raw_score_mean"] = recovery_target_info["raw_score"].mean().item()
+                loss_dict["replan_score_loss"] = replan_score_loss.item()
+                loss_dict["replan_target_mean"] = replan_target_info["target"].mean().item()
+                loss_dict["replan_raw_score_mean"] = replan_target_info["raw_score"].mean().item()
                 loss_dict["future_action_correction_mean"] = (
-                    recovery_target_info["future_action_correction"].mean().item()
+                    replan_target_info["future_action_correction"].mean().item()
                 )
 
         key_history_aux_outputs = getattr(self.model, "key_history_aux_outputs", None)
@@ -919,15 +931,15 @@ class ACT(nn.Module):
             self.history_aux_action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
             self.history_aux_action_hat = None
 
-        recovery_adaptive_cfg = self.config.history_token_replan_score
-        if recovery_adaptive_cfg.use_history_token:
-            self.recovery_adaptive_chunking_model = RecoveryAdaptiveChunkingModel(
+        history_replan_cfg = self.config.history_token_replan_score
+        if self.config.use_history_token_replan_score:
+            self.history_token_replan_score_model = HistoryTokenReplanScoreModel(
                 state_dim=self.config.robot_state_feature.shape[0],
                 action_dim=self.config.action_feature.shape[0],
                 dim_model=config.dim_model,
-                config=recovery_adaptive_cfg,
+                config=history_replan_cfg,
             )
-            self.recovery_aux_outputs = None
+            self.replan_aux_outputs = None
 
         if self.config.use_key_history_token:
             self.key_history_encoder = KeyHistoryTokenEncoder(
@@ -1057,8 +1069,8 @@ class ACT(nn.Module):
     # 实际执行动作预测的位置
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
 
-        if self.config.use_recovery_history_token:
-            self.recovery_aux_outputs = None
+        if self.config.use_history_token_replan_score:
+            self.replan_aux_outputs = None
         if self.config.use_key_history_token:
             self.key_history_aux_outputs = None
 
@@ -1162,19 +1174,19 @@ class ACT(nn.Module):
             # 最后把embedding放入tokens
             encoder_in_tokens.append(segment_understanding_embed)
 
-        if self.config.use_recovery_history_token:
+        if self.config.use_history_token_replan_score:
             missing = [key for key in (OBS_STATE_HISTORY, ACTION_HISTORY, HISTORY_MASK) if key not in batch]
             if missing:
-                raise KeyError(f"Missing recovery history batch keys: {missing}")
-            recovery_tokens, self.recovery_aux_outputs = self.recovery_adaptive_chunking_model(
+                raise KeyError(f"Missing history-token batch keys: {missing}")
+            history_tokens, self.replan_aux_outputs = self.history_token_replan_score_model(
                 state_history=batch[OBS_STATE_HISTORY],
                 action_history=batch[ACTION_HISTORY],
                 current_state=batch[OBS_STATE],
                 history_mask=batch[HISTORY_MASK],
             )
-            recovery_tokens = recovery_tokens.permute(1, 0, 2)  # [history_num_segments, B, D]
-            encoder_in_tokens.extend(list(recovery_tokens))
-            encoder_in_pos_embed.extend(list(self.recovery_adaptive_chunking_model.token_pos_embed.unsqueeze(1)))
+            history_tokens = history_tokens.permute(1, 0, 2)  # [history_num_segments, B, D]
+            encoder_in_tokens.extend(list(history_tokens))
+            encoder_in_pos_embed.extend(list(self.history_token_replan_score_model.token_pos_embed.unsqueeze(1)))
 
         if self.config.use_key_history_token:
             missing = [key for key in (OBS_STATE_HISTORY, HISTORY_MASK) if key not in batch]

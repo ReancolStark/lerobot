@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from lerobot.policies.customACT.recovery_adaptive_chunking.configuration_recovery_adaptive_chunking import (
-    RecoveryAdaptiveChunkingConfig,
+    HistoryTokenReplanScoreConfig,
 )
 
 
@@ -54,12 +54,12 @@ class CausalConv1d(nn.Module):
         return self.conv1d(x)
 
 
-class RecoveryAdaptiveChunkingModel(nn.Module):
-    """Integrated recovery-token model used by recovery-aware adaptive chunking.
+class HistoryTokenReplanScoreModel(nn.Module):
+    """History-token encoder with an auxiliary replan-score head.
 
     The module compresses normalized proprioceptive state/action history into a
-    small number of ACT encoder tokens and predicts a recovery score. The score
-    is trained with ``compute_recovery_score_loss`` and is consumed by the
+    small number of ACT encoder tokens and predicts a replan score. The score is
+    trained with ``compute_replan_score_loss`` and can be consumed by an
     adaptive chunk controller during inference.
     """
 
@@ -69,7 +69,7 @@ class RecoveryAdaptiveChunkingModel(nn.Module):
         state_dim: int,
         action_dim: int,
         dim_model: int,
-        config: RecoveryAdaptiveChunkingConfig,
+        config: HistoryTokenReplanScoreConfig,
     ) -> None:
         super().__init__()
         if state_dim <= 0 or action_dim <= 0 or dim_model <= 0:
@@ -121,7 +121,7 @@ class RecoveryAdaptiveChunkingModel(nn.Module):
         )
         self.token_pos_embed = nn.Parameter(torch.zeros(config.num_segments, dim_model))
         self.hist_action_head = nn.Linear(dim_model, action_dim)
-        self.recovery_score_head = nn.Sequential(
+        self.replan_score_head = nn.Sequential(
             nn.LayerNorm(dim_model),
             nn.Linear(dim_model, 1),
         )
@@ -237,27 +237,30 @@ class RecoveryAdaptiveChunkingModel(nn.Module):
             event_feat = torch.sum(seg_x * seg_weight.unsqueeze(-1), dim=1)
             segment_tokens.append(torch.cat([trend_feat, tail_feat, event_feat], dim=-1))
 
-        recovery_tokens = self.segment_proj(torch.stack(segment_tokens, dim=1))
-        token_summary = recovery_tokens.mean(dim=1)
+        history_tokens = self.segment_proj(torch.stack(segment_tokens, dim=1))
+        token_summary = history_tokens.mean(dim=1)
+        replan_score = torch.sigmoid(self.replan_score_head(token_summary))
         aux_outputs = {
             "event_scores": event_scores,
             "event_prior": event_prior,
             "hist_action_pred": self.hist_action_head(token_summary),
-            "recovery_score": torch.sigmoid(self.recovery_score_head(token_summary)),
+            "replan_score": replan_score,
+            # Backward-compatible key for old tests/checkpoints/scripts.
+            "recovery_score": replan_score,
         }
-        return recovery_tokens, aux_outputs
+        return history_tokens, aux_outputs
 
 
-def compute_recovery_score_target(
+def compute_replan_score_target(
     *,
     state_history: Tensor,
     action_history: Tensor,
     future_actions: Tensor,
     history_mask: Tensor,
-    config: RecoveryAdaptiveChunkingConfig,
+    config: HistoryTokenReplanScoreConfig,
     action_is_pad: Tensor | None = None,
 ) -> dict[str, Tensor]:
-    """Create a no-label recovery score target from ACT training data."""
+    """Create a no-label replan-score target from ACT training data."""
     if state_history.ndim != 3:
         raise ValueError(f"state_history must be [B,H,state_dim], got {state_history.shape}")
     if action_history.ndim != 3:
@@ -279,8 +282,8 @@ def compute_recovery_score_target(
     else:
         exec_error = torch.zeros_like(state_motion)
 
-    recent_exec_error = _masked_recent_mean(exec_error, mask, config.recovery_score_recent_steps)
-    recent_state_motion = _masked_recent_mean(state_motion, mask, config.recovery_score_recent_steps)
+    recent_exec_error = _masked_recent_mean(exec_error, mask, config.replan_score_recent_steps)
+    recent_state_motion = _masked_recent_mean(state_motion, mask, config.replan_score_recent_steps)
 
     last_action = _last_valid(action_history, mask)
     first_future_action = future_actions[:, 0]
@@ -320,17 +323,17 @@ def compute_recovery_score_target(
     }
 
 
-def compute_recovery_score_loss(
+def compute_replan_score_loss(
     *,
-    recovery_score: Tensor,
+    replan_score: Tensor,
     state_history: Tensor,
     action_history: Tensor,
     future_actions: Tensor,
     history_mask: Tensor,
-    config: RecoveryAdaptiveChunkingConfig,
+    config: HistoryTokenReplanScoreConfig,
     action_is_pad: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    target_info = compute_recovery_score_target(
+    target_info = compute_replan_score_target(
         state_history=state_history,
         action_history=action_history,
         future_actions=future_actions,
@@ -338,7 +341,7 @@ def compute_recovery_score_loss(
         config=config,
         action_is_pad=action_is_pad,
     )
-    pred = recovery_score.squeeze(-1).clamp(1e-6, 1.0 - 1e-6)
+    pred = replan_score.squeeze(-1).clamp(1e-6, 1.0 - 1e-6)
     target = target_info["target"].to(device=pred.device, dtype=pred.dtype)
     bce = F.binary_cross_entropy(pred, target, reduction="none")
 
@@ -352,23 +355,33 @@ def compute_recovery_score_loss(
 
 
 @dataclass
-class AdaptiveActionChunkingDecision:
+class ThreeRegimeAdaptiveChunkingDecision:
     chunk_size: int
     base_chunk_size: int
     old_action_weight: float
     state_volatility: float
     state_acceleration: float
     action_uncertainty: float
-    recovery_score: float | None
+    replan_score: float | None
     regime: str
 
+    @property
+    def recovery_score(self) -> float | None:
+        """Backward-compatible alias for older code."""
+        return self.replan_score
 
-class RecoveryAdaptiveChunkingController:
-    """Inference controller that consumes recovery score and predicted ACT chunks."""
+
+class ThreeRegimeAdaptiveChunkingController:
+    """Stable/nominal/unstable adaptive chunk controller.
+
+    This is the earlier controller: it combines state volatility, state
+    acceleration, action-chunk uncertainty, and the learned replan score to pick
+    one of three regimes.
+    """
 
     def __init__(
         self,
-        config: RecoveryAdaptiveChunkingConfig,
+        config: HistoryTokenReplanScoreConfig,
         *,
         policy_chunk_size: int,
         policy_n_action_steps: int,
@@ -381,7 +394,7 @@ class RecoveryAdaptiveChunkingController:
         self.min_chunk_size = min(max(1, config.min_chunk_size), self.max_chunk_size)
         self.state_history = deque([], maxlen=max(2, config.state_history_len))
         self.previous_chunk_size: int | None = None
-        self.latest_decision: AdaptiveActionChunkingDecision | None = None
+        self.latest_decision: ThreeRegimeAdaptiveChunkingDecision | None = None
         self.ensembled_actions: Tensor | None = None
         self.last_executed_action: Tensor | None = None
         self.prediction_count = 0
@@ -428,8 +441,11 @@ class RecoveryAdaptiveChunkingController:
         self,
         actions: Tensor,
         *,
+        replan_score: float | None = None,
         recovery_score: float | None = None,
-    ) -> AdaptiveActionChunkingDecision:
+    ) -> ThreeRegimeAdaptiveChunkingDecision:
+        if replan_score is None:
+            replan_score = recovery_score
         max_chunk_size = min(self.max_chunk_size, actions.shape[1])
         min_chunk_size = min(self.min_chunk_size, max_chunk_size)
         base_chunk_size, action_uncertainty = self._base_chunk_size_from_actions(
@@ -439,19 +455,19 @@ class RecoveryAdaptiveChunkingController:
         )
         state_volatility, state_acceleration = self._state_motion_stats()
 
-        high_recovery = recovery_score is not None and recovery_score >= self.config.recovery_score_high
+        high_replan_score = replan_score is not None and replan_score >= self.config.replan_score_high
         high_action_uncertainty = action_uncertainty >= self.config.action_uncertainty_high
         unstable = (
             state_volatility >= self.config.volatility_high
             or state_acceleration >= self.config.acceleration_high
-            or high_recovery
+            or high_replan_score
             or high_action_uncertainty
         )
         stable = (
             state_volatility <= self.config.volatility_low
             and state_acceleration < self.config.acceleration_high * 0.5
             and action_uncertainty <= self.config.action_uncertainty_low
-            and not high_recovery
+            and not high_replan_score
         )
 
         if unstable:
@@ -476,14 +492,14 @@ class RecoveryAdaptiveChunkingController:
             min(max(old_action_weight, self.config.min_old_action_weight), self.config.max_old_action_weight)
         )
 
-        decision = AdaptiveActionChunkingDecision(
+        decision = ThreeRegimeAdaptiveChunkingDecision(
             chunk_size=chunk_size,
             base_chunk_size=base_chunk_size,
             old_action_weight=old_action_weight,
             state_volatility=state_volatility,
             state_acceleration=state_acceleration,
             action_uncertainty=action_uncertainty,
-            recovery_score=recovery_score,
+            replan_score=replan_score,
             regime=regime,
         )
         self.latest_decision = decision
@@ -603,7 +619,7 @@ class RecoveryAdaptiveChunkingController:
         *,
         predicted_actions: Tensor,
         executed_actions: Tensor,
-        decision: AdaptiveActionChunkingDecision | None,
+        decision: ThreeRegimeAdaptiveChunkingDecision | None,
         source: str,
     ) -> None:
         if not self.config.debug_print_chunks:
@@ -621,12 +637,12 @@ class RecoveryAdaptiveChunkingController:
         if decision is None:
             metrics = "aac=off"
         else:
-            recovery = "none" if decision.recovery_score is None else f"{decision.recovery_score:.4f}"
+            replan = "none" if decision.replan_score is None else f"{decision.replan_score:.4f}"
             metrics = (
                 f"regime={decision.regime} base_k={decision.base_chunk_size} "
                 f"k_final={decision.chunk_size} old_w={decision.old_action_weight:.3f} "
                 f"state_v={decision.state_volatility:.4f} state_a={decision.state_acceleration:.4f} "
-                f"act_u={decision.action_uncertainty:.4f} recovery={recovery}"
+                f"act_u={decision.action_uncertainty:.4f} replan={replan}"
             )
             if self.latest_guard_limit is not None:
                 metrics += (
@@ -635,16 +651,16 @@ class RecoveryAdaptiveChunkingController:
                 )
 
         print(
-            f"[RAC][predict #{self.prediction_count}][{source}] "
+            f"[TRAC][predict #{self.prediction_count}][{source}] "
             f"predicted_chunk={predicted_len} executed_chunk={executed_len} {metrics}",
             flush=True,
         )
         print(
-            f"[RAC][predict #{self.prediction_count}] predicted_preview={self._preview_actions(predicted_actions)}",
+            f"[TRAC][predict #{self.prediction_count}] predicted_preview={self._preview_actions(predicted_actions)}",
             flush=True,
         )
         print(
-            f"[RAC][predict #{self.prediction_count}] executed_preview={self._preview_actions(executed_actions)}",
+            f"[TRAC][predict #{self.prediction_count}] executed_preview={self._preview_actions(executed_actions)}",
             flush=True,
         )
 
@@ -654,7 +670,7 @@ class RecoveryAdaptiveChunkingController:
         self.execution_count += 1
         self.current_chunk_step += 1
         print(
-            f"[RAC][execute #{self.execution_count}][{source}] "
+            f"[TRAC][execute #{self.execution_count}][{source}] "
             f"chunk_step={self.current_chunk_step}/{self.current_chunk_size} "
             f"remaining={remaining_actions} action={self._preview_action(action)}",
             flush=True,
@@ -745,11 +761,69 @@ class RecoveryAdaptiveChunkingController:
         return [round(float(v), 4) for v in action[:action_dims]]
 
 
+def compute_recovery_score_target(
+    *,
+    state_history: Tensor,
+    action_history: Tensor,
+    future_actions: Tensor,
+    history_mask: Tensor,
+    config: HistoryTokenReplanScoreConfig,
+    action_is_pad: Tensor | None = None,
+) -> dict[str, Tensor]:
+    """Backward-compatible wrapper for ``compute_replan_score_target``."""
+    return compute_replan_score_target(
+        state_history=state_history,
+        action_history=action_history,
+        future_actions=future_actions,
+        history_mask=history_mask,
+        config=config,
+        action_is_pad=action_is_pad,
+    )
+
+
+def compute_recovery_score_loss(
+    *,
+    recovery_score: Tensor | None = None,
+    replan_score: Tensor | None = None,
+    state_history: Tensor,
+    action_history: Tensor,
+    future_actions: Tensor,
+    history_mask: Tensor,
+    config: HistoryTokenReplanScoreConfig,
+    action_is_pad: Tensor | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Backward-compatible wrapper for ``compute_replan_score_loss``."""
+    if replan_score is None:
+        if recovery_score is None:
+            raise ValueError("Either `replan_score` or legacy `recovery_score` must be provided.")
+        replan_score = recovery_score
+    return compute_replan_score_loss(
+        replan_score=replan_score,
+        state_history=state_history,
+        action_history=action_history,
+        future_actions=future_actions,
+        history_mask=history_mask,
+        config=config,
+        action_is_pad=action_is_pad,
+    )
+
+
+# Backward-compatible aliases for older scripts/checkpoints.
+AdaptiveActionChunkingDecision = ThreeRegimeAdaptiveChunkingDecision
+RecoveryAdaptiveChunkingController = ThreeRegimeAdaptiveChunkingController
+RecoveryAdaptiveChunkingModel = HistoryTokenReplanScoreModel
+
+
 __all__ = [
     "AdaptiveActionChunkingDecision",
     "CausalConv1d",
+    "HistoryTokenReplanScoreModel",
     "RecoveryAdaptiveChunkingController",
     "RecoveryAdaptiveChunkingModel",
+    "ThreeRegimeAdaptiveChunkingController",
+    "ThreeRegimeAdaptiveChunkingDecision",
     "compute_recovery_score_loss",
     "compute_recovery_score_target",
+    "compute_replan_score_loss",
+    "compute_replan_score_target",
 ]

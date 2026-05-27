@@ -145,7 +145,7 @@ class ReplanScoreAdaptiveChunkingController:
             if self.config.fallback_replan_score is None:
                 raise ValueError(
                     "Replan-score adaptive chunking is enabled, but no replan score was produced. "
-                    "Enable recovery history token scoring or set `fallback_replan_score`."
+                    "Enable history-token replan scoring or set `fallback_replan_score`."
                 )
             replan_score = self.config.fallback_replan_score
         return float(min(max(replan_score, 0.0), 1.0))

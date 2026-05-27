@@ -17,7 +17,7 @@ class HistoryTokenAdaptiveChunkingConfig:
 
     mode: str = "replan_score"
     min_chunk_size: int = 8
-    max_chunk_size: int = 0     # 0 表示使用 ACT chunk 上限
+    max_chunk_size: int = 0  # 0 means use the ACT runtime chunk upper bound.
     score_smoothing_beta: float = 0.8
     max_chunk_delta: int = 16
     fallback_replan_score: float | None = None

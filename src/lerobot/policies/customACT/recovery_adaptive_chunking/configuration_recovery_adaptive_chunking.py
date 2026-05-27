@@ -84,11 +84,15 @@ class HistoryTokenReplanScoreConfig:
         unified = deepcopy(
             getattr(cfg, "history_token_replan_score", getattr(cfg, "recovery_adaptive_chunking", cls()))
         )
+        legacy_history_token_enabled = (
+            getattr(cfg, "use_history_token_replan_score", False)
+            or getattr(cfg, "use_recovery_history_token", False)
+        )
         unified.enabled = bool(
-            getattr(cfg, "use_recovery_history_token", False)
+            legacy_history_token_enabled
             or getattr(cfg, "use_adaptive_action_chunking", False)
         )
-        unified.use_history_token = bool(getattr(cfg, "use_recovery_history_token", False))
+        unified.use_history_token = bool(legacy_history_token_enabled)
         unified.use_adaptive_action_chunking = bool(getattr(cfg, "use_adaptive_action_chunking", False))
 
         unified.history_len = int(getattr(cfg, "history_len", unified.history_len))
@@ -105,7 +109,11 @@ class HistoryTokenReplanScoreConfig:
             getattr(cfg, "use_action_state_error", unified.use_action_state_error)
         )
         unified.token_pos_embed = str(
-            getattr(cfg, "recovery_token_pos_embed", unified.token_pos_embed)
+            getattr(
+                cfg,
+                "history_token_pos_embed",
+                getattr(cfg, "recovery_token_pos_embed", unified.token_pos_embed),
+            )
         )
         unified.action_loss_weight = float(
             getattr(cfg, "history_action_loss_weight", unified.action_loss_weight)
@@ -113,7 +121,11 @@ class HistoryTokenReplanScoreConfig:
         unified.event_prior_loss_weight = float(
             getattr(cfg, "event_prior_loss_weight", unified.event_prior_loss_weight)
         )
-        legacy_aac = getattr(cfg, "adaptive_action_chunking", None)
+        legacy_aac = getattr(
+            cfg,
+            "three_regime_adaptive_chunking",
+            getattr(cfg, "adaptive_action_chunking", None),
+        )
         if legacy_aac is not None:
             for name in (
                 "state_history_len",
@@ -185,35 +197,35 @@ class HistoryTokenReplanScoreConfig:
 
         if self.use_adaptive_action_chunking:
             if self.state_history_len < 2:
-                raise ValueError("`adaptive_action_chunking.state_history_len` must be >= 2.")
+                raise ValueError("`three_regime_adaptive_chunking.state_history_len` must be >= 2.")
             if self.min_chunk_size <= 0:
-                raise ValueError("`adaptive_action_chunking.min_chunk_size` must be positive.")
+                raise ValueError("`three_regime_adaptive_chunking.min_chunk_size` must be positive.")
             if self.max_chunk_size < 0:
-                raise ValueError("`adaptive_action_chunking.max_chunk_size` cannot be negative.")
+                raise ValueError("`three_regime_adaptive_chunking.max_chunk_size` cannot be negative.")
             if self.max_chunk_size and self.max_chunk_size < self.min_chunk_size:
-                raise ValueError("`adaptive_action_chunking.max_chunk_size` must be >= min_chunk_size.")
+                raise ValueError("`three_regime_adaptive_chunking.max_chunk_size` must be >= min_chunk_size.")
             if self.stable_chunk_multiplier <= 0 or self.unstable_chunk_multiplier <= 0:
                 raise ValueError("Adaptive chunk multipliers must be positive.")
             if self.volatility_low < 0 or self.volatility_high < 0 or self.acceleration_high < 0:
                 raise ValueError("Adaptive chunk motion thresholds cannot be negative.")
             if self.volatility_low > self.volatility_high:
-                raise ValueError("`adaptive_action_chunking.volatility_low` must be <= volatility_high.")
+                raise ValueError("`three_regime_adaptive_chunking.volatility_low` must be <= volatility_high.")
             if self.action_uncertainty_low < 0 or self.action_uncertainty_high < 0:
                 raise ValueError("Adaptive chunk action uncertainty thresholds cannot be negative.")
             if self.action_uncertainty_low > self.action_uncertainty_high:
-                raise ValueError("`adaptive_action_chunking.action_uncertainty_low` must be <= high.")
+                raise ValueError("`three_regime_adaptive_chunking.action_uncertainty_low` must be <= high.")
             if self.transition_blend_steps < 0:
-                raise ValueError("`adaptive_action_chunking.transition_blend_steps` cannot be negative.")
+                raise ValueError("`three_regime_adaptive_chunking.transition_blend_steps` cannot be negative.")
             if not 0 <= self.transition_blend_old_action_weight <= 1:
                 raise ValueError(
-                    "`adaptive_action_chunking.transition_blend_old_action_weight` must be between 0 and 1."
+                    "`three_regime_adaptive_chunking.transition_blend_old_action_weight` must be between 0 and 1."
                 )
             if self.action_step_guard_mad_scale < 0:
                 raise ValueError("`adaptive_action_chunking.action_step_guard_mad_scale` cannot be negative.")
             if self.action_step_guard_min_norm < 0:
                 raise ValueError("`adaptive_action_chunking.action_step_guard_min_norm` cannot be negative.")
             if self.debug_print_every <= 0:
-                raise ValueError("`adaptive_action_chunking.debug_print_every` must be positive.")
+                raise ValueError("`three_regime_adaptive_chunking.debug_print_every` must be positive.")
             if self.debug_print_num_actions < 0 or self.debug_print_action_dims < 0:
                 raise ValueError("Adaptive chunk debug preview sizes cannot be negative.")
 
