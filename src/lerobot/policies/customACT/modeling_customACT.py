@@ -101,7 +101,7 @@ class ACTPolicy(PreTrainedPolicy):
         self.adaptive_action_chunker = None
         if config.use_adaptive_action_chunking:
             self.adaptive_action_chunker = RecoveryAdaptiveChunkingController(
-                config.recovery_adaptive_chunking,
+                config.history_token_replan_score,
                 policy_chunk_size=config.chunk_size,
                 policy_n_action_steps=(
                     config.chunk_size if config.temporal_ensemble_coeff is not None else config.n_action_steps
@@ -109,9 +109,12 @@ class ACTPolicy(PreTrainedPolicy):
             )
 
         self.replan_score_adaptive_chunker = None
-        if config.use_replan_score_adaptive_chunking:
+        if (
+            config.use_history_token_adaptive_chunking
+            and config.history_token_adaptive_chunking.mode == "replan_score"
+        ):
             self.replan_score_adaptive_chunker = ReplanScoreAdaptiveChunkingController(
-                config.replan_score_adaptive_chunking,
+                config.history_token_adaptive_chunking,
                 policy_chunk_size=config.chunk_size,
                 policy_n_action_steps=config.n_action_steps,
             )
@@ -597,8 +600,8 @@ class ACTPolicy(PreTrainedPolicy):
 
             loss = (
                 loss
-                + self.config.recovery_adaptive_chunking.action_loss_weight * hist_action_loss
-                + self.config.recovery_adaptive_chunking.event_prior_loss_weight * event_prior_loss
+                + self.config.history_token_replan_score.action_loss_weight * hist_action_loss
+                + self.config.history_token_replan_score.event_prior_loss_weight * event_prior_loss
             )
             loss_dict["hist_action_loss"] = hist_action_loss.item()
             loss_dict["event_prior_loss"] = event_prior_loss.item()
@@ -608,7 +611,7 @@ class ACTPolicy(PreTrainedPolicy):
             else:
                 loss_dict["event_score_mean"] = 0.0
 
-            if self.config.recovery_adaptive_chunking.recovery_score_loss_weight > 0:
+            if self.config.history_token_replan_score.replan_score_loss_weight > 0:
                 recovery_score_loss, recovery_target_info = compute_recovery_score_loss(
                     recovery_score=recovery_aux_outputs["recovery_score"],
                     state_history=batch[OBS_STATE_HISTORY],
@@ -616,11 +619,11 @@ class ACTPolicy(PreTrainedPolicy):
                     future_actions=batch[ACTION],
                     history_mask=batch[HISTORY_MASK],
                     action_is_pad=batch.get("action_is_pad"),
-                    config=self.config.recovery_adaptive_chunking,
+                    config=self.config.history_token_replan_score,
                 )
                 loss = (
                     loss
-                    + self.config.recovery_adaptive_chunking.recovery_score_loss_weight
+                    + self.config.history_token_replan_score.replan_score_loss_weight
                     * recovery_score_loss
                 )
                 loss_dict["recovery_score_loss"] = recovery_score_loss.item()
@@ -916,8 +919,8 @@ class ACT(nn.Module):
             self.history_aux_action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
             self.history_aux_action_hat = None
 
-        recovery_adaptive_cfg = self.config.recovery_adaptive_chunking
-        if recovery_adaptive_cfg.use_recovery_token:
+        recovery_adaptive_cfg = self.config.history_token_replan_score
+        if recovery_adaptive_cfg.use_history_token:
             self.recovery_adaptive_chunking_model = RecoveryAdaptiveChunkingModel(
                 state_dim=self.config.robot_state_feature.shape[0],
                 action_dim=self.config.action_feature.shape[0],

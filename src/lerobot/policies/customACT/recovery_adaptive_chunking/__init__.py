@@ -1,4 +1,7 @@
-from .configuration_recovery_adaptive_chunking import RecoveryAdaptiveChunkingConfig
+from .configuration_recovery_adaptive_chunking import (
+    HistoryTokenReplanScoreConfig,
+    RecoveryAdaptiveChunkingConfig,
+)
 from .modeling_recovery_adaptive_chunking import (
     AdaptiveActionChunkingDecision,
     CausalConv1d,
@@ -14,6 +17,7 @@ __all__ = [
     "AdaptiveActionChunkingController",
     "AdaptiveActionChunkingDecision",
     "CausalConv1d",
+    "HistoryTokenReplanScoreConfig",
     "RecoveryAdaptiveChunkingConfig",
     "RecoveryAdaptiveChunkingController",
     "RecoveryAdaptiveChunkingModel",

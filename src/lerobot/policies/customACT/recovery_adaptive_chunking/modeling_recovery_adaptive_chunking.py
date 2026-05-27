@@ -286,7 +286,7 @@ def compute_recovery_score_target(
     first_future_action = future_actions[:, 0]
     future_action_correction = _rms(first_future_action - last_action)
 
-    if future_actions.shape[1] > 1 and config.recovery_future_action_curvature_weight > 0:
+    if future_actions.shape[1] > 1 and config.replan_future_action_curvature_weight > 0:
         second_future_action = future_actions[:, 1]
         future_curvature = _rms(second_future_action - 2.0 * first_future_action + last_action)
         if action_is_pad is not None and action_is_pad.shape[1] > 1:
@@ -294,7 +294,7 @@ def compute_recovery_score_target(
             future_curvature = future_curvature * second_valid
         future_action_correction = (
             future_action_correction
-            + config.recovery_future_action_curvature_weight * future_curvature
+            + config.replan_future_action_curvature_weight * future_curvature
         )
 
     if action_is_pad is not None:
@@ -302,13 +302,13 @@ def compute_recovery_score_target(
         future_action_correction = future_action_correction * first_valid
 
     raw_score = (
-        config.recovery_exec_error_weight * recent_exec_error
-        + config.recovery_state_motion_weight * recent_state_motion
-        + config.recovery_future_action_correction_weight * future_action_correction
+        config.replan_exec_error_weight * recent_exec_error
+        + config.replan_state_motion_weight * recent_state_motion
+        + config.replan_future_action_correction_weight * future_action_correction
     )
     target = torch.sigmoid(
-        (raw_score - config.recovery_score_target_center)
-        / config.recovery_score_target_temperature
+        (raw_score - config.replan_score_target_center)
+        / config.replan_score_target_temperature
     )
 
     return {

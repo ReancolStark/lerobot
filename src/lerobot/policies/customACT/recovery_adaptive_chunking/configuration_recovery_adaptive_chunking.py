@@ -6,21 +6,21 @@ from typing import Any
 
 
 @dataclass
-class RecoveryAdaptiveChunkingConfig:
-    """Unified config for recovery tokens and recovery-aware adaptive chunking.
+class HistoryTokenReplanScoreConfig:
+    """Unified config for history tokens and replan-score training.
 
-    The recovery token is trained from history. The adaptive chunk controller uses
-    the trained recovery score at inference time, together with action/state
-    volatility, to decide how much of the predicted ACT chunk should be executed.
+    The history token branch is trained from state/action history and predicts a
+    replan score. The preferred adaptive chunk controller maps that score
+    directly to the number of predicted ACT actions to execute.
     """
 
-    enabled: bool = True
+    enabled: bool = False
 
     # Module switches.
-    use_recovery_token: bool = True
+    use_history_token: bool = True
     use_adaptive_action_chunking: bool = True
 
-    # Recovery token encoder.
+    # History token encoder.
     history_len: int = 64
     num_segments: int = 4
     hidden_dim: int = 256
@@ -30,19 +30,19 @@ class RecoveryAdaptiveChunkingConfig:
     use_action_state_error: bool = True
     token_pos_embed: str = "learned"
 
-    # Recovery token auxiliary losses.
+    # History token auxiliary losses.
     action_loss_weight: float = 0.05
     event_prior_loss_weight: float = 0.01
 
-    # Recovery score pseudo-label loss.
-    recovery_score_loss_weight: float = 0.05
-    recovery_score_target_center: float = 1.0
-    recovery_score_target_temperature: float = 0.35
-    recovery_score_recent_steps: int = 8
-    recovery_exec_error_weight: float = 0.45
-    recovery_state_motion_weight: float = 0.25
-    recovery_future_action_correction_weight: float = 0.30
-    recovery_future_action_curvature_weight: float = 0.5
+    # Replan score pseudo-label loss.
+    replan_score_loss_weight: float = 0.05
+    replan_score_target_center: float = 1.0
+    replan_score_target_temperature: float = 0.35
+    replan_score_recent_steps: int = 8
+    replan_exec_error_weight: float = 0.45
+    replan_state_motion_weight: float = 0.25
+    replan_future_action_correction_weight: float = 0.30
+    replan_future_action_curvature_weight: float = 0.5
 
     # Inference-time adaptive action chunking.
     state_history_len: int = 64
@@ -55,7 +55,7 @@ class RecoveryAdaptiveChunkingConfig:
     volatility_low: float = 0.03
     volatility_high: float = 0.12
     acceleration_high: float = 0.10
-    recovery_score_high: float = 0.65
+    replan_score_high: float = 0.65
     action_uncertainty_low: float = 0.03
     action_uncertainty_high: float = 0.15
     action_curvature_weight: float = 0.5
@@ -75,18 +75,20 @@ class RecoveryAdaptiveChunkingConfig:
     debug_print_action_dims: int = 6
 
     @classmethod
-    def from_legacy_config(cls, cfg: Any) -> "RecoveryAdaptiveChunkingConfig":
+    def from_legacy_config(cls, cfg: Any) -> "HistoryTokenReplanScoreConfig":
         """Build the unified config from the existing ACTConfig fields.
 
         This keeps old command lines and checkpoints compatible while exposing a
         single nested config for new experiments.
         """
-        unified = deepcopy(getattr(cfg, "recovery_adaptive_chunking", cls()))
+        unified = deepcopy(
+            getattr(cfg, "history_token_replan_score", getattr(cfg, "recovery_adaptive_chunking", cls()))
+        )
         unified.enabled = bool(
             getattr(cfg, "use_recovery_history_token", False)
             or getattr(cfg, "use_adaptive_action_chunking", False)
         )
-        unified.use_recovery_token = bool(getattr(cfg, "use_recovery_history_token", False))
+        unified.use_history_token = bool(getattr(cfg, "use_recovery_history_token", False))
         unified.use_adaptive_action_chunking = bool(getattr(cfg, "use_adaptive_action_chunking", False))
 
         unified.history_len = int(getattr(cfg, "history_len", unified.history_len))
@@ -124,6 +126,7 @@ class RecoveryAdaptiveChunkingConfig:
                 "volatility_low",
                 "volatility_high",
                 "acceleration_high",
+                "replan_score_high",
                 "recovery_score_high",
                 "action_uncertainty_low",
                 "action_uncertainty_high",
@@ -151,34 +154,34 @@ class RecoveryAdaptiveChunkingConfig:
         if not self.enabled:
             return
 
-        if self.use_recovery_token:
+        if self.use_history_token:
             if self.history_len <= 0:
-                raise ValueError("`recovery_adaptive_chunking.history_len` must be positive.")
+                raise ValueError("`history_token_replan_score.history_len` must be positive.")
             if self.num_segments <= 0:
-                raise ValueError("`recovery_adaptive_chunking.num_segments` must be positive.")
+                raise ValueError("`history_token_replan_score.num_segments` must be positive.")
             if self.history_len < self.num_segments:
-                raise ValueError("`recovery_adaptive_chunking.history_len` must be >= num_segments.")
+                raise ValueError("`history_token_replan_score.history_len` must be >= num_segments.")
             if self.hidden_dim <= 0:
-                raise ValueError("`recovery_adaptive_chunking.hidden_dim` must be positive.")
+                raise ValueError("`history_token_replan_score.hidden_dim` must be positive.")
             if self.conv_kernel_size <= 0:
-                raise ValueError("`recovery_adaptive_chunking.conv_kernel_size` must be positive.")
+                raise ValueError("`history_token_replan_score.conv_kernel_size` must be positive.")
             if not self.conv_dilations:
-                raise ValueError("`recovery_adaptive_chunking.conv_dilations` cannot be empty.")
+                raise ValueError("`history_token_replan_score.conv_dilations` cannot be empty.")
             if self.token_pos_embed != "learned":
-                raise ValueError("Only `recovery_adaptive_chunking.token_pos_embed='learned'` is supported.")
-            if self.recovery_score_loss_weight < 0:
-                raise ValueError("`recovery_score_loss_weight` cannot be negative.")
-            if self.recovery_score_target_temperature <= 0:
-                raise ValueError("`recovery_score_target_temperature` must be positive.")
-            if self.recovery_score_recent_steps <= 0:
-                raise ValueError("`recovery_score_recent_steps` must be positive.")
+                raise ValueError("Only `history_token_replan_score.token_pos_embed='learned'` is supported.")
+            if self.replan_score_loss_weight < 0:
+                raise ValueError("`replan_score_loss_weight` cannot be negative.")
+            if self.replan_score_target_temperature <= 0:
+                raise ValueError("`replan_score_target_temperature` must be positive.")
+            if self.replan_score_recent_steps <= 0:
+                raise ValueError("`replan_score_recent_steps` must be positive.")
             if min(
-                self.recovery_exec_error_weight,
-                self.recovery_state_motion_weight,
-                self.recovery_future_action_correction_weight,
-                self.recovery_future_action_curvature_weight,
+                self.replan_exec_error_weight,
+                self.replan_state_motion_weight,
+                self.replan_future_action_correction_weight,
+                self.replan_future_action_curvature_weight,
             ) < 0:
-                raise ValueError("Recovery score target weights cannot be negative.")
+                raise ValueError("Replan score target weights cannot be negative.")
 
         if self.use_adaptive_action_chunking:
             if self.state_history_len < 2:
@@ -213,3 +216,60 @@ class RecoveryAdaptiveChunkingConfig:
                 raise ValueError("`adaptive_action_chunking.debug_print_every` must be positive.")
             if self.debug_print_num_actions < 0 or self.debug_print_action_dims < 0:
                 raise ValueError("Adaptive chunk debug preview sizes cannot be negative.")
+
+    @property
+    def use_recovery_token(self) -> bool:
+        return self.use_history_token
+
+    @use_recovery_token.setter
+    def use_recovery_token(self, value: bool) -> None:
+        self.use_history_token = value
+
+    @property
+    def recovery_score_loss_weight(self) -> float:
+        return self.replan_score_loss_weight
+
+    @recovery_score_loss_weight.setter
+    def recovery_score_loss_weight(self, value: float) -> None:
+        self.replan_score_loss_weight = value
+
+    @property
+    def recovery_score_target_center(self) -> float:
+        return self.replan_score_target_center
+
+    @property
+    def recovery_score_target_temperature(self) -> float:
+        return self.replan_score_target_temperature
+
+    @property
+    def recovery_score_recent_steps(self) -> int:
+        return self.replan_score_recent_steps
+
+    @property
+    def recovery_exec_error_weight(self) -> float:
+        return self.replan_exec_error_weight
+
+    @property
+    def recovery_state_motion_weight(self) -> float:
+        return self.replan_state_motion_weight
+
+    @property
+    def recovery_future_action_correction_weight(self) -> float:
+        return self.replan_future_action_correction_weight
+
+    @property
+    def recovery_future_action_curvature_weight(self) -> float:
+        return self.replan_future_action_curvature_weight
+
+    @property
+    def recovery_score_high(self) -> float:
+        return self.replan_score_high
+
+    @recovery_score_high.setter
+    def recovery_score_high(self, value: float) -> None:
+        self.replan_score_high = value
+
+
+# Backward-compatible alias for older checkpoints/scripts. New code should use
+# HistoryTokenReplanScoreConfig and configuration_customACT.history_token_replan_score.
+RecoveryAdaptiveChunkingConfig = HistoryTokenReplanScoreConfig

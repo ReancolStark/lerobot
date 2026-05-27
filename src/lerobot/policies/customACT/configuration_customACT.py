@@ -21,9 +21,10 @@ from lerobot.optim.optimizers import AdamWConfig
 from lerobot.policies.customACT.history_obs_state.configuration_history_obs import HistoryObsConfig, HistoryLSTMConfig, HistoryConv1dConfig
 from lerobot.policies.customACT.key_history_state.configuration_key_history import KeyHistoryTokenConfig
 from lerobot.policies.customACT.model_adaptive_chunk.configuration_model_adaptive_chunk import (
-    ReplanScoreAdaptiveChunkingConfig,
+    HistoryTokenAdaptiveChunkingConfig,
 )
 from lerobot.policies.customACT.recovery_adaptive_chunking.configuration_recovery_adaptive_chunking import (
+    HistoryTokenReplanScoreConfig,
     RecoveryAdaptiveChunkingConfig,
 )
 from lerobot.policies.customACT.segment_understanding.configuration_segment_understanding import SegmentUnderstandingConfig
@@ -101,14 +102,20 @@ class ACTConfig(PreTrainedConfig):
     """
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
     # recovery_token+自适应动作块统一配置。
-    # Unified config for the recovery token, recovery score pseudo-label, and adaptive chunk controller.
-    # Existing top-level fields remain supported; __post_init__ syncs them into this nested config.
-    recovery_adaptive_chunking: RecoveryAdaptiveChunkingConfig = field(
-        default_factory=RecoveryAdaptiveChunkingConfig
+    # Unified config for the history-token branch and replan-score training.
+    # Existing legacy top-level fields remain supported; __post_init__ syncs them
+    # into this nested config when use_history_token_replan_score_config is False.
+    history_token_replan_score: HistoryTokenReplanScoreConfig = field(
+        default_factory=HistoryTokenReplanScoreConfig
     )
     # False keeps legacy top-level fields as the source of truth. Set True for new
-    # experiments that configure recovery token + AAC only through the nested config.
-    use_recovery_adaptive_chunking_config: bool = True
+    # experiments that configure history-token + replan-score only through the nested config.
+    # history_token+自适应chunk创新点要一直开着
+    use_history_token_replan_score_config: bool = True
+
+    # Total switch for the proposed innovation: history tokens produce a replan
+    # score, then adaptive chunking decides how many predicted actions to execute.
+    use_history_token_adaptive_chunking: bool = False
 
     # 是否开启计算状态平滑度指标（state smoothness），用于评估动作块内状态变化的平滑程度。这个指标可以帮助分析自适应动作块的效果，尤其是在运动突变发生时状态的变化情况。
     compute_state_smoothness: bool = True
@@ -216,13 +223,10 @@ class ACTConfig(PreTrainedConfig):
         default_factory=AdaptiveActionChunkingConfig
     )
 
-    # Replan-score-only adaptive chunking. This replaces the three-regime
-    # controller at inference time and maps recovery/replan score directly to
-    # the number of actions inserted into the execution queue.
-    # 启用replan-score-only的自适应动作块。这在推理阶段替换原来的三阶段控制器，直接将recovery/replan分数映射到执行队列中插入的动作数量。
-    use_replan_score_adaptive_chunking: bool = False
-    replan_score_adaptive_chunking: ReplanScoreAdaptiveChunkingConfig = field(
-        default_factory=ReplanScoreAdaptiveChunkingConfig
+    # Select which adaptive chunking strategy to use when
+    # use_history_token_adaptive_chunking is enabled.
+    history_token_adaptive_chunking: HistoryTokenAdaptiveChunkingConfig = field(
+        default_factory=HistoryTokenAdaptiveChunkingConfig
     )
 
 
@@ -291,10 +295,17 @@ class ACTConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.use_recovery_adaptive_chunking_config:
-            self._apply_recovery_adaptive_chunking_config()
+        if self.use_history_token_adaptive_chunking:
+            self.history_token_replan_score.enabled = True
+            self.history_token_replan_score.use_history_token = True
+            self.history_token_replan_score.use_adaptive_action_chunking = (
+                self.history_token_adaptive_chunking.mode == "three_regime"
+            )
+
+        if self.use_history_token_replan_score_config:
+            self._apply_history_token_replan_score_config()
         else:
-            self.recovery_adaptive_chunking = self.get_recovery_adaptive_chunking_config()
+            self.history_token_replan_score = self.get_history_token_replan_score_config()
 
         """Input validation (not exhaustive)."""
         # if not self.vision_backbone.startswith("resnet"):
@@ -380,27 +391,33 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError("`adaptive_action_chunking.debug_print_every` must be positive.")
             if aac.debug_print_num_actions < 0 or aac.debug_print_action_dims < 0:
                 raise ValueError("Adaptive chunk debug preview sizes cannot be negative.")
-        if self.use_replan_score_adaptive_chunking:
-            if self.temporal_ensemble_coeff is not None:
+        if self.use_history_token_adaptive_chunking:
+            if (
+                self.temporal_ensemble_coeff is not None
+                and self.history_token_adaptive_chunking.mode == "replan_score"
+            ):
                 raise ValueError(
-                    "`use_replan_score_adaptive_chunking` is only supported by the queued inference path. "
-                    "Disable temporal ensembling for this controller."
+                    "`use_history_token_adaptive_chunking` with mode='replan_score' is only supported by the "
+                    "queued inference path. Disable temporal ensembling for this controller."
                 )
-            if self.use_adaptive_action_chunking:
+            if (
+                self.use_adaptive_action_chunking
+                and self.history_token_adaptive_chunking.mode != "three_regime"
+            ):
                 raise ValueError(
-                    "`use_replan_score_adaptive_chunking` and `use_adaptive_action_chunking` are mutually "
-                    "exclusive. Disable the old three-regime adaptive chunk controller first."
+                    "`use_adaptive_action_chunking` is only valid for "
+                    "history_token_adaptive_chunking.mode='three_regime'."
                 )
             if (
                 not self.use_recovery_history_token
-                and self.replan_score_adaptive_chunking.fallback_replan_score is None
+                and self.history_token_adaptive_chunking.fallback_replan_score is None
             ):
                 raise ValueError(
-                    "`use_replan_score_adaptive_chunking` requires recovery history token scoring, or a "
-                    "`replan_score_adaptive_chunking.fallback_replan_score`."
+                    "`use_history_token_adaptive_chunking` requires history-token replan scoring, or a "
+                    "`history_token_adaptive_chunking.fallback_replan_score`."
                 )
-            self.replan_score_adaptive_chunking.validate()
-        self.recovery_adaptive_chunking.validate()
+            self.history_token_adaptive_chunking.validate()
+        self.history_token_replan_score.validate()
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -450,16 +467,19 @@ class ACTConfig(PreTrainedConfig):
             token_pos_embed=self.key_history_token_pos_embed,
         )
 
-    def get_recovery_adaptive_chunking_config(self) -> RecoveryAdaptiveChunkingConfig:
-        return RecoveryAdaptiveChunkingConfig.from_legacy_config(self)
+    def get_history_token_replan_score_config(self) -> HistoryTokenReplanScoreConfig:
+        return HistoryTokenReplanScoreConfig.from_legacy_config(self)
 
-    def _apply_recovery_adaptive_chunking_config(self) -> None:
-        rac = self.recovery_adaptive_chunking
-        self.use_recovery_history_token = rac.enabled and rac.use_recovery_token
+    def _apply_history_token_replan_score_config(self) -> None:
+        rac = self.history_token_replan_score
+        self.use_recovery_history_token = rac.enabled and rac.use_history_token
         self.use_adaptive_action_chunking = (
             rac.enabled
             and rac.use_adaptive_action_chunking
-            and not self.use_replan_score_adaptive_chunking
+            and (
+                not self.use_history_token_adaptive_chunking
+                or self.history_token_adaptive_chunking.mode == "three_regime"
+            )
         )
 
         self.history_len = rac.history_len
@@ -483,7 +503,7 @@ class ACTConfig(PreTrainedConfig):
             "volatility_low",
             "volatility_high",
             "acceleration_high",
-            "recovery_score_high",
+            "replan_score_high",
             "action_uncertainty_low",
             "action_uncertainty_high",
             "action_curvature_weight",

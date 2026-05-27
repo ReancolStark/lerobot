@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lerobot.policies.customACT.model_adaptive_chunk.configuration_model_adaptive_chunk import (
-    ReplanScoreAdaptiveChunkingConfig,
+    HistoryTokenAdaptiveChunkingConfig,
 )
 
 
@@ -23,7 +23,7 @@ class ReplanScoreAdaptiveChunkingController:
 
     def __init__(
         self,
-        config: ReplanScoreAdaptiveChunkingConfig,
+        config: HistoryTokenAdaptiveChunkingConfig,
         *,
         policy_chunk_size: int,
         policy_n_action_steps: int,
