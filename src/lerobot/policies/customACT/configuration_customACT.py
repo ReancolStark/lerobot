@@ -20,6 +20,9 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.policies.customACT.history_obs_state.configuration_history_obs import HistoryObsConfig, HistoryLSTMConfig, HistoryConv1dConfig
 from lerobot.policies.customACT.key_history_state.configuration_key_history import KeyHistoryTokenConfig
+from lerobot.policies.customACT.model_adaptive_chunk.configuration_model_adaptive_chunk import (
+    ReplanScoreAdaptiveChunkingConfig,
+)
 from lerobot.policies.customACT.recovery_adaptive_chunking.configuration_recovery_adaptive_chunking import (
     RecoveryAdaptiveChunkingConfig,
 )
@@ -213,6 +216,15 @@ class ACTConfig(PreTrainedConfig):
         default_factory=AdaptiveActionChunkingConfig
     )
 
+    # Replan-score-only adaptive chunking. This replaces the three-regime
+    # controller at inference time and maps recovery/replan score directly to
+    # the number of actions inserted into the execution queue.
+    # 启用replan-score-only的自适应动作块。这在推理阶段替换原来的三阶段控制器，直接将recovery/replan分数映射到执行队列中插入的动作数量。
+    use_replan_score_adaptive_chunking: bool = False
+    replan_score_adaptive_chunking: ReplanScoreAdaptiveChunkingConfig = field(
+        default_factory=ReplanScoreAdaptiveChunkingConfig
+    )
+
 
 
 
@@ -368,6 +380,26 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError("`adaptive_action_chunking.debug_print_every` must be positive.")
             if aac.debug_print_num_actions < 0 or aac.debug_print_action_dims < 0:
                 raise ValueError("Adaptive chunk debug preview sizes cannot be negative.")
+        if self.use_replan_score_adaptive_chunking:
+            if self.temporal_ensemble_coeff is not None:
+                raise ValueError(
+                    "`use_replan_score_adaptive_chunking` is only supported by the queued inference path. "
+                    "Disable temporal ensembling for this controller."
+                )
+            if self.use_adaptive_action_chunking:
+                raise ValueError(
+                    "`use_replan_score_adaptive_chunking` and `use_adaptive_action_chunking` are mutually "
+                    "exclusive. Disable the old three-regime adaptive chunk controller first."
+                )
+            if (
+                not self.use_recovery_history_token
+                and self.replan_score_adaptive_chunking.fallback_replan_score is None
+            ):
+                raise ValueError(
+                    "`use_replan_score_adaptive_chunking` requires recovery history token scoring, or a "
+                    "`replan_score_adaptive_chunking.fallback_replan_score`."
+                )
+            self.replan_score_adaptive_chunking.validate()
         self.recovery_adaptive_chunking.validate()
 
     def get_optimizer_preset(self) -> AdamWConfig:
@@ -424,7 +456,11 @@ class ACTConfig(PreTrainedConfig):
     def _apply_recovery_adaptive_chunking_config(self) -> None:
         rac = self.recovery_adaptive_chunking
         self.use_recovery_history_token = rac.enabled and rac.use_recovery_token
-        self.use_adaptive_action_chunking = rac.enabled and rac.use_adaptive_action_chunking
+        self.use_adaptive_action_chunking = (
+            rac.enabled
+            and rac.use_adaptive_action_chunking
+            and not self.use_replan_score_adaptive_chunking
+        )
 
         self.history_len = rac.history_len
         self.history_num_segments = rac.num_segments

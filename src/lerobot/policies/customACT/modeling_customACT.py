@@ -52,6 +52,7 @@ from lerobot.utils.constants import (
 #新增：自己的import
 from lerobot.policies.customACT.history_obs_state.modeling_history_obs import HistoryObsStateEmbedding
 from lerobot.policies.customACT.key_history_state.modeling_key_history import KeyHistoryTokenEncoder
+from lerobot.policies.customACT.model_adaptive_chunk import ReplanScoreAdaptiveChunkingController
 from lerobot.policies.customACT.recovery_adaptive_chunking import (
     RecoveryAdaptiveChunkingController,
     RecoveryAdaptiveChunkingModel,
@@ -105,6 +106,14 @@ class ACTPolicy(PreTrainedPolicy):
                 policy_n_action_steps=(
                     config.chunk_size if config.temporal_ensemble_coeff is not None else config.n_action_steps
                 ),
+            )
+
+        self.replan_score_adaptive_chunker = None
+        if config.use_replan_score_adaptive_chunking:
+            self.replan_score_adaptive_chunker = ReplanScoreAdaptiveChunkingController(
+                config.replan_score_adaptive_chunking,
+                policy_chunk_size=config.chunk_size,
+                policy_n_action_steps=config.n_action_steps,
             )
 
         self.reset()
@@ -195,6 +204,8 @@ class ACTPolicy(PreTrainedPolicy):
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
         if self.adaptive_action_chunker is not None:
             self.adaptive_action_chunker.reset()
+        if self.replan_score_adaptive_chunker is not None:
+            self.replan_score_adaptive_chunker.reset()
         if self.config.use_recovery_history_token:
             self._recovery_state_buffer = deque([], maxlen=self.config.history_len)
             self._recovery_action_buffer = deque([], maxlen=self.config.history_len)
@@ -373,6 +384,29 @@ class ACTPolicy(PreTrainedPolicy):
             recovery_score=self._get_recovery_score_for_adaptive_action_chunking(),
         )
 
+    def _adapt_action_chunk_with_replan_score(
+        self,
+        actions: Tensor,
+        *,
+        max_actions_per_chunk: int | None = None,
+    ) -> Tensor:
+        if self.replan_score_adaptive_chunker is None:
+            raise RuntimeError("Replan-score adaptive chunker is not enabled.")
+
+        decision = self.replan_score_adaptive_chunker.decide(
+            replan_score=self._get_recovery_score_for_adaptive_action_chunking(),
+            available_actions=actions.shape[1],
+            max_actions_per_chunk=max_actions_per_chunk,
+        )
+        selected_actions = actions[:, : decision.chunk_size]
+        self.replan_score_adaptive_chunker.debug_prediction(
+            predicted_actions=actions,
+            executed_actions=selected_actions,
+            decision=decision,
+            source="replan_score_chunk",
+        )
+        return selected_actions
+
     def adapt_action_chunk_for_inference(
         self,
         actions: Tensor,
@@ -380,6 +414,12 @@ class ACTPolicy(PreTrainedPolicy):
         max_actions_per_chunk: int | None = None,
     ) -> Tensor:
         """Return the action prefix selected by the adaptive chunk controller."""
+        if self.replan_score_adaptive_chunker is not None:
+            return self._adapt_action_chunk_with_replan_score(
+                actions,
+                max_actions_per_chunk=max_actions_per_chunk,
+            )
+
         if self.adaptive_action_chunker is None:
             if max_actions_per_chunk is None:
                 max_actions_per_chunk = self.config.n_action_steps
@@ -458,6 +498,12 @@ class ACTPolicy(PreTrainedPolicy):
                 source="select_action",
             )
             self.adaptive_action_chunker.observe_executed_action(action)
+        elif self.replan_score_adaptive_chunker is not None:
+            self.replan_score_adaptive_chunker.debug_execution(
+                action=action,
+                remaining_actions=len(self._action_queue),
+                source="select_action",
+            )
         self._record_recovery_action(action)
         return action
 
