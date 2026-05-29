@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+from torch import Tensor
+
 from lerobot.policies.customACT.model_adaptive_chunk.configuration_model_adaptive_chunk import (
     HistoryTokenAdaptiveChunkingConfig,
 )
@@ -16,6 +19,8 @@ class ReplanScoreAdaptiveChunkingDecision:
     smoothed_replan_score: float
     min_chunk_size: int
     max_chunk_size: int
+    boundary_score: float | None = None
+    boundary_blend: float = 0.0
 
 
 class ReplanScoreAdaptiveChunkingController:
@@ -37,6 +42,8 @@ class ReplanScoreAdaptiveChunkingController:
         self.previous_replan_score: float | None = None
         self.previous_chunk_size: int | None = None
         self.latest_decision: ReplanScoreAdaptiveChunkingDecision | None = None
+        self.previous_executed_action: Tensor | None = None
+        self.last_executed_action: Tensor | None = None
         self.prediction_count = 0
         self.execution_count = 0
         self.current_chunk_size = 0
@@ -46,6 +53,8 @@ class ReplanScoreAdaptiveChunkingController:
         self.previous_replan_score = None
         self.previous_chunk_size = None
         self.latest_decision = None
+        self.previous_executed_action = None
+        self.last_executed_action = None
         self.prediction_count = 0
         self.execution_count = 0
         self.current_chunk_size = 0
@@ -89,6 +98,72 @@ class ReplanScoreAdaptiveChunkingController:
         self.latest_decision = decision
         return decision
 
+    def smooth_chunk_transition(
+        self,
+        actions: Tensor,
+        *,
+        decision: ReplanScoreAdaptiveChunkingDecision | None = None,
+    ) -> Tensor:
+        if (
+            not self.config.use_boundary_transition
+            or self.last_executed_action is None
+            or actions.ndim != 3
+            or actions.shape[1] == 0
+        ):
+            if decision is not None:
+                decision.boundary_score = None
+                decision.boundary_blend = 0.0
+            return actions
+
+        max_transition_steps = actions.shape[1] if actions.shape[1] == 1 else actions.shape[1] - 1
+        blend_steps = min(max(0, self.config.boundary_transition_steps), max_transition_steps)
+        max_blend = min(max(self.config.boundary_transition_max_blend, 0.0), 1.0)
+        if blend_steps == 0 or max_blend <= 0:
+            if decision is not None:
+                decision.boundary_score = None
+                decision.boundary_blend = 0.0
+            return actions
+
+        last_action = self.last_executed_action.to(device=actions.device, dtype=actions.dtype).view(1, -1)
+        if last_action.shape[-1] != actions.shape[-1]:
+            if decision is not None:
+                decision.boundary_score = None
+                decision.boundary_blend = 0.0
+            return actions
+
+        prev_action = None
+        if self.previous_executed_action is not None:
+            prev_action = self.previous_executed_action.to(device=actions.device, dtype=actions.dtype).view(1, -1)
+            if prev_action.shape[-1] != actions.shape[-1]:
+                prev_action = None
+
+        boundary_score = self._boundary_score(actions, last_action, prev_action)
+        blend = self._boundary_blend_weight(boundary_score)
+        if decision is not None:
+            decision.boundary_score = boundary_score
+            decision.boundary_blend = blend
+        if blend <= 0:
+            return actions
+
+        target_index = min(blend_steps, actions.shape[1] - 1)
+        target_action = actions[:, target_index]
+        smoothed = actions.clone()
+        for step in range(blend_steps):
+            progress = float(step + 1) / float(blend_steps + 1)
+            eased = self._minimum_jerk(progress)
+            bridge = (1.0 - eased) * last_action + eased * target_action
+            smoothed[:, step] = blend * bridge + (1.0 - blend) * actions[:, step]
+        return smoothed
+
+    def observe_executed_action(self, action: Tensor) -> None:
+        action = action.detach()
+        if action.ndim == 1:
+            action = action.unsqueeze(0)
+        if action.shape[0] != 1:
+            return
+        self.previous_executed_action = self.last_executed_action
+        self.last_executed_action = action[0].float().cpu()
+
     def debug_prediction(
         self,
         *,
@@ -114,7 +189,9 @@ class ReplanScoreAdaptiveChunkingController:
             f"predicted_chunk={predicted_len} executed_chunk={executed_len} "
             f"raw_k={decision.raw_chunk_size} k_final={decision.chunk_size} "
             f"score={decision.replan_score:.4f} score_smooth={decision.smoothed_replan_score:.4f} "
-            f"k_range=[{decision.min_chunk_size},{decision.max_chunk_size}]",
+            f"k_range=[{decision.min_chunk_size},{decision.max_chunk_size}] "
+            f"boundary_score={self._format_optional_float(decision.boundary_score)} "
+            f"boundary_blend={decision.boundary_blend:.4f}",
             flush=True,
         )
         print(
@@ -177,6 +254,34 @@ class ReplanScoreAdaptiveChunkingController:
     @staticmethod
     def _clip_chunk_size(chunk_size: int, min_chunk_size: int, max_chunk_size: int) -> int:
         return int(min(max(chunk_size, min_chunk_size), max_chunk_size))
+
+    def _boundary_score(self, actions: Tensor, last_action: Tensor, prev_action: Tensor | None) -> float:
+        curvature_weight = max(0.0, self.config.boundary_transition_curvature_weight)
+        first_jump = torch.linalg.vector_norm(actions[:, 0] - last_action, dim=-1)
+        score = first_jump
+        if prev_action is not None:
+            boundary_acc = torch.linalg.vector_norm(actions[:, 0] - 2.0 * last_action + prev_action, dim=-1)
+            score = score + curvature_weight * boundary_acc
+        if actions.shape[1] > 1:
+            early_curvature = torch.linalg.vector_norm(actions[:, 1] - 2.0 * actions[:, 0] + last_action, dim=-1)
+            score = score + curvature_weight * early_curvature
+        return float(score.detach().mean().item())
+
+    def _boundary_blend_weight(self, boundary_score: float) -> float:
+        scale = max(self.config.boundary_transition_score_scale, 1e-6)
+        max_blend = min(max(self.config.boundary_transition_max_blend, 0.0), 1.0)
+        return max_blend * min(max(boundary_score / scale, 0.0), 1.0)
+
+    @staticmethod
+    def _minimum_jerk(progress: float) -> float:
+        progress = min(max(progress, 0.0), 1.0)
+        return 10.0 * progress**3 - 15.0 * progress**4 + 6.0 * progress**5
+
+    @staticmethod
+    def _format_optional_float(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        return f"{value:.4f}"
 
     def _preview_actions(self, actions: Any) -> list[list[float]]:
         num_actions = max(0, self.config.debug_print_num_actions)

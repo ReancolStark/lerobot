@@ -21,6 +21,11 @@ class HistoryTokenAdaptiveChunkingConfig:
     score_smoothing_beta: float = 0.8
     max_chunk_delta: int = 16
     fallback_replan_score: float | None = None
+    use_boundary_transition: bool = True
+    boundary_transition_steps: int = 3
+    boundary_transition_max_blend: float = 0.6
+    boundary_transition_score_scale: float = 1.0
+    boundary_transition_curvature_weight: float = 0.5
     debug_print_chunks: bool = True
     debug_print_every: int = 1
     debug_print_num_actions: int = 3
@@ -45,6 +50,20 @@ class HistoryTokenAdaptiveChunkingConfig:
             raise ValueError("`history_token_adaptive_chunking.max_chunk_delta` cannot be negative.")
         if self.fallback_replan_score is not None and not 0.0 <= self.fallback_replan_score <= 1.0:
             raise ValueError("`history_token_adaptive_chunking.fallback_replan_score` must be in [0, 1].")
+        if self.boundary_transition_steps < 0:
+            raise ValueError("`history_token_adaptive_chunking.boundary_transition_steps` cannot be negative.")
+        if not 0.0 <= self.boundary_transition_max_blend <= 1.0:
+            raise ValueError(
+                "`history_token_adaptive_chunking.boundary_transition_max_blend` must be in [0, 1]."
+            )
+        if self.boundary_transition_score_scale <= 0:
+            raise ValueError(
+                "`history_token_adaptive_chunking.boundary_transition_score_scale` must be positive."
+            )
+        if self.boundary_transition_curvature_weight < 0:
+            raise ValueError(
+                "`history_token_adaptive_chunking.boundary_transition_curvature_weight` cannot be negative."
+            )
         if self.debug_print_every <= 0:
             raise ValueError("`history_token_adaptive_chunking.debug_print_every` must be positive.")
         if self.debug_print_num_actions < 0 or self.debug_print_action_dims < 0:

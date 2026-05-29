@@ -414,6 +414,10 @@ class ACTPolicy(PreTrainedPolicy):
             max_actions_per_chunk=max_actions_per_chunk,
         )
         selected_actions = actions[:, : decision.chunk_size]
+        selected_actions = self.replan_score_adaptive_chunker.smooth_chunk_transition(
+            selected_actions,
+            decision=decision,
+        )
         self.replan_score_adaptive_chunker.debug_prediction(
             predicted_actions=actions,
             executed_actions=selected_actions,
@@ -519,6 +523,7 @@ class ACTPolicy(PreTrainedPolicy):
                 remaining_actions=len(self._action_queue),
                 source="select_action",
             )
+            self.replan_score_adaptive_chunker.observe_executed_action(action)
         self._record_history_token_action(action)
         return action
 
