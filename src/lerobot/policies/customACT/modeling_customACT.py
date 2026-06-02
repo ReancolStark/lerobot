@@ -570,21 +570,7 @@ class ACT(nn.Module):
                     backbone_model.fc.in_features, config.dim_model, kernel_size=1
                 )
 
-        self.mask_weight_mode = getattr(config.mw_config, "mode", "adapter")
-        if self.config.use_mask_weight and self.mask_weight_mode not in {
-            "region_attention",
-            "adapter",
-            "legacy_multiply",
-        }:
-            raise ValueError(
-                f"Unknown mask_weight mode: {self.mask_weight_mode}. "
-                "Expected 'region_attention', 'adapter', or 'legacy_multiply'."
-            )
-        if (
-            self.config.image_features
-            and self.config.use_mask_weight
-            and self.mask_weight_mode in {"region_attention", "adapter"}
-        ):
+        if self.config.image_features and self.config.use_mask_weight:
             self.mask_guided_visual_adapter = MaskGuidedVisualAdapter(config.dim_model, config.mw_config)
         
 
@@ -936,33 +922,10 @@ class ACT(nn.Module):
                             (mask_for_debug > 0.05).float().mean().item()
                         )
 
-                    # 处理mask形状
-                    if self.mask_weight_mode == "legacy_multiply":
-                        target_h, target_w = cam_features.shape[-2:]
-                        mask_resized = torch.nn.functional.interpolate(
-                            yolo_mask,
-                            size=(target_h, target_w),
-                            mode='bilinear',
-                            align_corners=False
-                        )
-                        mask_resized = mask_resized.to(dtype=cam_features.dtype, device=cam_features.device)
-
-                    # 用mask处理feature
-                        mask_resized = torch.clamp(mask_resized, 0.0, 1.0)
-                        alpha = self.config.mw_config.alpha
-                        beta = self.config.mw_config.beta
-                        cam_features = cam_features * (beta + alpha * mask_resized)
-                
-                    # from lerobot.debug_tools.img_batch_save import save_im5g_list
-                    # save_img_list(img, "testimg/img")
-                    # save_img_list(imgs_for_yolo, "testimg/imgs_for_yolo")
-                    # save_img_list(yolo_mask, "testimg/yolo_mask")
-                    # save_img_list(mask_resized, "testimg/mask_resized")
-
                 # 投影features到指定维度
                 cam_features = self.encoder_img_feat_input_proj(cam_features)    # [8, 512, 15, 20] -> [8, 512, 15, 20]
 
-                if self.config.use_mask_weight and self.mask_weight_mode in {"region_attention", "adapter"}:
+                if self.config.use_mask_weight:
                     target_h, target_w = cam_features.shape[-2:]
                     mask_resized = torch.nn.functional.interpolate(
                         yolo_mask,

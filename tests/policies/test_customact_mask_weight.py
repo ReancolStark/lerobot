@@ -58,11 +58,6 @@ def test_mask_guided_visual_adapter_target_tokens():
     assert target_pos_embed.shape == (3, 1, 8)
 
 
-def test_mask_weight_config_rejects_invalid_mode():
-    with pytest.raises(ValueError):
-        MaskWeightConfig(mode="bad_mode")
-
-
 def test_mask_weight_config_rejects_invalid_background_strength():
     with pytest.raises(ValueError):
         MaskWeightConfig(background_aug_min_strength=0.9, background_aug_max_strength=0.2)
@@ -85,7 +80,6 @@ def test_mask_weight_config_rejects_invalid_v4_params():
 def test_region_attention_reliability_gate_falls_back_on_empty_mask():
     torch.manual_seed(0)
     config = MaskWeightConfig(
-        mode="region_attention",
         adapter_hidden_dim=4,
         mask_dropout_p=0.0,
         mask_noise_p=0.0,

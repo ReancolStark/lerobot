@@ -3,17 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class MaskWeightConfig:
-    # "region_attention" is the v4 path: YOLO masks build target/context/background
-    # region tokens, then a reliability-gated cross-attention calibrates visual tokens.
-    # "adapter" injects YOLO masks as visual-token guidance.
-    # "legacy_multiply" keeps the old fixed feature multiplication for ablations.
-    mode: str = "region_attention"
-
-    # Legacy multiply: features = features * (beta + alpha * mask).
-    alpha: float = 1.0
-    beta: float = 0.5
-
-    # Mask-guided adapter switches.
+    # V4 mask-guided adapter switches.
     use_spatial_embedding: bool = True
     use_residual_gate: bool = True
     use_target_tokens: bool = False
@@ -76,8 +66,6 @@ class MaskWeightConfig:
     record_debug_log: bool = True
 
     def __post_init__(self):
-        if self.mode not in {"region_attention", "adapter", "legacy_multiply"}:
-            raise ValueError(f"Unknown MaskWeightConfig.mode={self.mode!r}.")
         if not 0.0 <= self.mask_dropout_p <= 1.0:
             raise ValueError("mask_dropout_p must be in [0, 1].")
         if not 0.0 <= self.reliability_min_area <= 1.0:

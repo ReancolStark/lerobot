@@ -265,8 +265,8 @@ class MaskGuidedVisualAdapter(nn.Module):
             self.feature_adapter = None
             self.register_parameter("gate_scale", None)
 
-        self.use_region_attention = config.mode == "region_attention" and bool(config.use_region_attention)
-        self.use_reliability_gate = config.mode == "region_attention" and bool(config.use_reliability_gate)
+        self.use_region_attention = bool(config.use_region_attention)
+        self.use_reliability_gate = bool(config.use_reliability_gate)
         if self.use_region_attention:
             num_heads = int(config.region_attention_heads)
             if dim_model % num_heads != 0:
