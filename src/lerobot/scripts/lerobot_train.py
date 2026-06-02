@@ -77,11 +77,7 @@ def _write_customact_mask_weight_config(output_dir, policy: PreTrainedPolicy) ->
 
     output_dir.mkdir(parents=True, exist_ok=True)
     mw_config = policy.config.mw_config
-    tested_path = (
-        "Mask-Guided Visual Adapter + optional target tokens"
-        if mw_config.mode == "adapter"
-        else "Legacy fixed hard multiply"
-    )
+    tested_path = "Reliability-Gated Region Attention Adapter"
     if getattr(mw_config, "use_background_augmentation", False):
         tested_path += " + mask-guided background augmentation"
     if getattr(mw_config, "use_background_consistency", False):
@@ -151,6 +147,8 @@ def _collect_mask_weight_grad_debug(policy: PreTrainedPolicy) -> dict[str, float
             group = "feature_adapter"
         elif name.startswith("target_token"):
             group = "target_tokens"
+        elif name.startswith("region_"):
+            group = "region_attention"
         elif name == "gate_scale":
             group = "gate_scale"
         else:
@@ -458,8 +456,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         logging.info("Start offline training on a fixed dataset")
 
     # 如果用到了实例分割模块，将预处理传入customACT
-    if (isinstance(policy, customACT) and 
-        isinstance(policy.config, customACTConfig) and 
+    if (isinstance(policy, customACT) and
+        isinstance(policy.config, customACTConfig) and
         (policy.config.use_segment_understanding or policy.config.use_mask_weight)):
         policy.set_preprocessor(preprocessor)
 

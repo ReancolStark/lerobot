@@ -136,8 +136,6 @@ from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 from lerobot.policies.customACT.modeling_customACT import ACTPolicy as customACT
 from lerobot.policies.customACT.modeling_customACT import ACTConfig as customACTConfig
 
-
-
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -404,6 +402,9 @@ def record_loop(    # 录制循环
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset: # 实际开始录制
+    global obs_window
+    obs_window = None
+
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
@@ -474,7 +475,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset: # 实际开始录制
 
     #新增：特判customACT，创建滑动队列 
     if policy is not None and isinstance(cfg.policy, CustomACTConfig) and cfg.policy.n_history_obs_states > 0:
-        global obs_window
         obs_window = deque(maxlen=cfg.policy.n_history_obs_states)
     
     #新增：如果用到了实例分割模块，将预处理传入customACT
