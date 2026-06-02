@@ -231,7 +231,7 @@ class MaskGuidedVisualAdapter(nn.Module):
 
     The adapter keeps the RGB backbone path intact. YOLO masks are used only as
     intermediate token guidance: spatial mask embeddings, an optional residual
-    target gate, and optional target summary tokens.
+    target gate, optional target summary tokens, and a v4 region-attention path.
     """
 
     def __init__(self, dim_model: int, config: MaskWeightConfig):
@@ -265,6 +265,43 @@ class MaskGuidedVisualAdapter(nn.Module):
             self.feature_adapter = None
             self.register_parameter("gate_scale", None)
 
+        self.use_region_attention = config.mode == "region_attention" and bool(config.use_region_attention)
+        self.use_reliability_gate = config.mode == "region_attention" and bool(config.use_reliability_gate)
+        if self.use_region_attention:
+            num_heads = int(config.region_attention_heads)
+            if dim_model % num_heads != 0:
+                raise ValueError(
+                    f"region_attention_heads={num_heads} must divide dim_model={dim_model}."
+                )
+            self.region_token_proj = nn.Sequential(
+                nn.LayerNorm(dim_model),
+                nn.Linear(dim_model, dim_model),
+                nn.GELU(),
+                nn.Linear(dim_model, dim_model),
+            )
+            nn.init.zeros_(self.region_token_proj[-1].weight)
+            nn.init.zeros_(self.region_token_proj[-1].bias)
+            self.region_type_embed = nn.Parameter(torch.zeros(3, 1, dim_model))
+            self.region_cross_attn = nn.MultiheadAttention(
+                dim_model,
+                num_heads,
+                dropout=float(config.region_attention_dropout),
+                batch_first=False,
+            )
+            self.region_attn_out_proj = nn.Sequential(
+                nn.LayerNorm(dim_model),
+                nn.Linear(dim_model, dim_model),
+            )
+            nn.init.normal_(self.region_attn_out_proj[-1].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.region_attn_out_proj[-1].bias)
+            self.region_attention_scale = nn.Parameter(torch.tensor(float(config.region_attention_gate_init)))
+        else:
+            self.region_token_proj = None
+            self.register_parameter("region_type_embed", None)
+            self.region_cross_attn = None
+            self.region_attn_out_proj = None
+            self.register_parameter("region_attention_scale", None)
+
         self.num_target_tokens = max(0, int(config.num_target_tokens))
         if config.use_target_tokens and self.num_target_tokens > 0:
             self.target_token_proj = nn.Sequential(
@@ -280,7 +317,101 @@ class MaskGuidedVisualAdapter(nn.Module):
             self.target_token_proj = None
             self.register_parameter("target_token_pos_embed", None)
 
-    def _build_guidance(self, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    @staticmethod
+    def _shift_mask(mask: torch.Tensor, dx: int, dy: int) -> torch.Tensor:
+        shifted = torch.roll(mask, shifts=(dy, dx), dims=(-2, -1))
+        if dy > 0:
+            shifted[..., :dy, :] = 0
+        elif dy < 0:
+            shifted[..., dy:, :] = 0
+        if dx > 0:
+            shifted[..., :, :dx] = 0
+        elif dx < 0:
+            shifted[..., :, dx:] = 0
+        return shifted
+
+    def _apply_mask_noise(self, target_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.training or self.config.mask_noise_p <= 0.0:
+            return target_mask, torch.zeros(
+                target_mask.shape[0],
+                1,
+                1,
+                1,
+                dtype=target_mask.dtype,
+                device=target_mask.device,
+            )
+
+        batch_size = target_mask.shape[0]
+        apply_noise = (
+            torch.rand(batch_size, 1, 1, 1, dtype=target_mask.dtype, device=target_mask.device)
+            < float(self.config.mask_noise_p)
+        )
+        noisy_mask = target_mask
+
+        jitter_px = int(self.config.mask_noise_jitter_px)
+        if jitter_px > 0:
+            shifted_masks = []
+            shifts = torch.randint(
+                -jitter_px,
+                jitter_px + 1,
+                (batch_size, 2),
+                device=target_mask.device,
+            )
+            for i in range(batch_size):
+                dx = int(shifts[i, 0].item())
+                dy = int(shifts[i, 1].item())
+                shifted_masks.append(self._shift_mask(noisy_mask[i : i + 1], dx=dx, dy=dy))
+            noisy_mask = torch.cat(shifted_masks, dim=0)
+
+        if self.config.mask_noise_confidence_min < 1.0:
+            min_scale = float(self.config.mask_noise_confidence_min)
+            scale = min_scale + torch.rand(
+                batch_size,
+                1,
+                1,
+                1,
+                dtype=target_mask.dtype,
+                device=target_mask.device,
+            ) * (1.0 - min_scale)
+            noisy_mask = noisy_mask * scale
+
+        if self.config.mask_noise_dropout_p > 0.0:
+            keep_mask = (
+                torch.rand(batch_size, 1, 1, 1, dtype=target_mask.dtype, device=target_mask.device)
+                >= float(self.config.mask_noise_dropout_p)
+            ).to(dtype=target_mask.dtype)
+            noisy_mask = noisy_mask * keep_mask
+
+        apply_noise_float = apply_noise.to(dtype=target_mask.dtype)
+        target_mask = torch.where(apply_noise, noisy_mask, target_mask)
+        return target_mask, apply_noise_float
+
+    def _compute_reliability(self, target_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        confidence_score = target_mask.amax(dim=(2, 3), keepdim=True)
+        area = target_mask.mean(dim=(2, 3), keepdim=True)
+
+        min_area = float(self.config.reliability_min_area)
+        max_area = float(self.config.reliability_max_area)
+        if min_area > 0.0:
+            lower_area_score = torch.clamp(area / min_area, 0.0, 1.0)
+        else:
+            lower_area_score = torch.ones_like(area)
+        if max_area < 1.0:
+            upper_area_score = torch.clamp((1.0 - area) / (1.0 - max_area), 0.0, 1.0)
+        else:
+            upper_area_score = torch.ones_like(area)
+        area_score = lower_area_score * upper_area_score
+
+        reliability = torch.clamp(confidence_score * area_score, 0.0, 1.0)
+        floor = float(self.config.reliability_floor)
+        if floor > 0.0:
+            reliability = floor + (1.0 - floor) * reliability
+        return reliability, confidence_score, area
+
+    def _build_guidance(
+        self,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_mask = torch.clamp(mask, 0.0, 1.0)
 
         if self.training and self.config.mask_dropout_p > 0:
@@ -295,6 +426,9 @@ class MaskGuidedVisualAdapter(nn.Module):
             keep = (keep >= float(self.config.mask_dropout_p)).to(dtype=target_mask.dtype)
             target_mask = target_mask * keep
 
+        target_mask, mask_noise_applied = self._apply_mask_noise(target_mask)
+        reliability, confidence_score, mask_area = self._compute_reliability(target_mask)
+
         dilation = max(0, int(self.config.context_dilation))
         if dilation > 0:
             kernel_size = 2 * dilation + 1
@@ -304,8 +438,8 @@ class MaskGuidedVisualAdapter(nn.Module):
 
         context_mask = torch.clamp(dilated_mask - target_mask, 0.0, 1.0)
         background_mask = torch.clamp(1.0 - dilated_mask, 0.0, 1.0)
-        confidence_map = target_mask.amax(dim=(2, 3), keepdim=True).expand_as(target_mask)
-        return target_mask, context_mask, background_mask, confidence_map
+        confidence_map = confidence_score.expand_as(target_mask)
+        return target_mask, context_mask, background_mask, confidence_map, reliability, mask_area, mask_noise_applied
 
     @staticmethod
     def _masked_pool(features: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -335,6 +469,59 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_pos_embed = self.target_token_pos_embed.to(dtype=features.dtype, device=features.device)
         return target_tokens, target_pos_embed
 
+    def _make_region_tokens(
+        self,
+        features: torch.Tensor,
+        target_mask: torch.Tensor,
+        context_mask: torch.Tensor,
+        background_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pooled = [
+            self._masked_pool(features, target_mask),
+            self._masked_pool(features, context_mask),
+            self._masked_pool(features, background_mask),
+        ]
+        region_tokens = torch.stack(pooled, dim=0)
+        region_tokens = region_tokens + self.region_token_proj(region_tokens)
+        region_type_embed = self.region_type_embed.to(dtype=features.dtype, device=features.device)
+        return region_tokens + region_type_embed
+
+    def _apply_region_attention(
+        self,
+        visual_features: torch.Tensor,
+        target_mask: torch.Tensor,
+        context_mask: torch.Tensor,
+        background_mask: torch.Tensor,
+        reliability: torch.Tensor,
+        record_debug: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if not self.use_region_attention:
+            return visual_features, None, None
+
+        batch_size, channels, height, width = visual_features.shape
+        visual_tokens = visual_features.flatten(2).permute(2, 0, 1)
+        region_tokens = self._make_region_tokens(visual_features, target_mask, context_mask, background_mask)
+        attn_out, attn_weights = self.region_cross_attn(
+            visual_tokens,
+            region_tokens,
+            region_tokens,
+            need_weights=record_debug,
+            average_attn_weights=True,
+        )
+        attn_delta = self.region_attn_out_proj(attn_out)
+        attn_delta = attn_delta.permute(1, 2, 0).reshape(batch_size, channels, height, width)
+
+        spatial_weight = torch.clamp(
+            target_mask
+            + float(self.config.region_attention_context_weight) * context_mask
+            + float(self.config.region_attention_background_weight) * background_mask,
+            0.0,
+            1.0,
+        )
+        reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
+        region_delta = self.region_attention_scale * reliability_gate * spatial_weight * attn_delta
+        return visual_features + region_delta, region_delta, attn_weights
+
     def forward(
         self,
         visual_features: torch.Tensor,
@@ -342,19 +529,39 @@ class MaskGuidedVisualAdapter(nn.Module):
         record_debug: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         mask = mask.to(dtype=visual_features.dtype, device=visual_features.device)
-        target_mask, context_mask, background_mask, confidence_map = self._build_guidance(mask)
+        (
+            target_mask,
+            context_mask,
+            background_mask,
+            confidence_map,
+            reliability,
+            mask_area,
+            mask_noise_applied,
+        ) = self._build_guidance(mask)
         guidance = torch.cat([target_mask, context_mask, background_mask, confidence_map], dim=1)
+        reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
 
         guided_features = visual_features
         spatial_delta = None
         if self.mask_encoder is not None:
-            spatial_delta = self.mask_encoder(guidance)
+            spatial_delta = reliability_gate * self.mask_encoder(guidance)
             guided_features = guided_features + spatial_delta
 
         residual_delta = None
         if self.feature_adapter is not None:
-            residual_delta = self.gate_scale * target_mask * self.feature_adapter(visual_features)
+            residual_delta = reliability_gate * self.gate_scale * target_mask * self.feature_adapter(visual_features)
             guided_features = guided_features + residual_delta
+
+        region_delta = None
+        attn_weights = None
+        guided_features, region_delta, attn_weights = self._apply_region_attention(
+            guided_features,
+            target_mask,
+            context_mask,
+            background_mask,
+            reliability,
+            record_debug=record_debug,
+        )
 
         target_tokens, target_pos_embed = self._make_target_tokens(
             guided_features,
@@ -402,12 +609,19 @@ class MaskGuidedVisualAdapter(nn.Module):
                 if residual_delta is None
                 else residual_delta.detach().float().pow(2).mean().sqrt()
             )
+            region_delta_rms = (
+                torch.zeros((), device=visual_features.device)
+                if region_delta is None
+                else region_delta.detach().float().pow(2).mean().sqrt()
+            )
             self.latest_debug = {
                 "visual_rms": float(visual_rms.item()),
                 "spatial_delta_rms": float(spatial_delta_rms.item()),
                 "spatial_delta_ratio": float((spatial_delta_rms / visual_rms).item()),
                 "residual_delta_rms": float(residual_delta_rms.item()),
                 "residual_delta_ratio": float((residual_delta_rms / visual_rms).item()),
+                "region_attention_delta_rms": float(region_delta_rms.item()),
+                "region_attention_delta_ratio": float((region_delta_rms / visual_rms).item()),
                 "output_delta_rms": float(output_delta_rms.item()),
                 "output_delta_ratio": float((output_delta_rms / visual_rms).item()),
                 "input_target_rms": float(input_target_rms.item()),
@@ -422,5 +636,19 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "target_mask_mean": float(target_mask.detach().float().mean().item()),
                 "context_mask_mean": float(context_mask.detach().float().mean().item()),
                 "background_mask_mean": float(background_mask.detach().float().mean().item()),
+                "mask_area_mean": float(mask_area.detach().float().mean().item()),
+                "reliability_mean": float(reliability.detach().float().mean().item()),
+                "reliability_min": float(reliability.detach().float().min().item()),
+                "reliability_max": float(reliability.detach().float().max().item()),
+                "mask_noise_applied_ratio": float(mask_noise_applied.detach().float().mean().item()),
             }
+            if self.region_attention_scale is not None:
+                self.latest_debug["region_attention_gate"] = float(
+                    self.region_attention_scale.detach().item()
+                )
+            if attn_weights is not None:
+                region_attn_mean = attn_weights.detach().float().mean(dim=(0, 1))
+                self.latest_debug["region_attention_target_mean"] = float(region_attn_mean[0].item())
+                self.latest_debug["region_attention_context_mean"] = float(region_attn_mean[1].item())
+                self.latest_debug["region_attention_background_mean"] = float(region_attn_mean[2].item())
         return guided_features, target_tokens, target_pos_embed

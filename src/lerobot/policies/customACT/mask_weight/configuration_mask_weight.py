@@ -3,9 +3,11 @@ from dataclasses import dataclass
 
 @dataclass
 class MaskWeightConfig:
+    # "region_attention" is the v4 path: YOLO masks build target/context/background
+    # region tokens, then a reliability-gated cross-attention calibrates visual tokens.
     # "adapter" injects YOLO masks as visual-token guidance.
     # "legacy_multiply" keeps the old fixed feature multiplication for ablations.
-    mode: str = "adapter"
+    mode: str = "region_attention"
 
     # Legacy multiply: features = features * (beta + alpha * mask).
     alpha: float = 1.0
@@ -15,6 +17,8 @@ class MaskWeightConfig:
     use_spatial_embedding: bool = True
     use_residual_gate: bool = True
     use_target_tokens: bool = False
+    use_region_attention: bool = True
+    use_reliability_gate: bool = True
 
     # Mask-guided adapter hyperparameters.
     adapter_hidden_dim: int = 128
@@ -26,6 +30,27 @@ class MaskWeightConfig:
     # YOLO mask post-processing.
     mask_blur_kernel_size: int = 7
     mask_blur_sigma: float = 2.0
+
+    # V4 reliability gate. These values are measured on the feature-grid mask
+    # area, not raw pixels. If YOLO is missing, too tiny, or too large, the
+    # mask-guided residual path is weakened and the policy falls back toward ACT.
+    reliability_min_area: float = 0.002
+    reliability_max_area: float = 0.65
+    reliability_floor: float = 0.0
+
+    # V4 region cross-attention.
+    region_attention_heads: int = 4
+    region_attention_dropout: float = 0.0
+    region_attention_gate_init: float = 0.1
+    region_attention_context_weight: float = 0.5
+    region_attention_background_weight: float = 0.1
+
+    # V4 mask corruption during training. This teaches the policy not to trust
+    # YOLO as a perfect sensor while keeping the original RGB path intact.
+    mask_noise_p: float = 0.1
+    mask_noise_jitter_px: int = 1
+    mask_noise_confidence_min: float = 0.5
+    mask_noise_dropout_p: float = 0.1
 
     # Training-time background counterfactuals. These are off by default because
     # consistency training requires an extra policy forward pass.
@@ -51,10 +76,34 @@ class MaskWeightConfig:
     record_debug_log: bool = True
 
     def __post_init__(self):
-        if self.mode not in {"adapter", "legacy_multiply"}:
+        if self.mode not in {"region_attention", "adapter", "legacy_multiply"}:
             raise ValueError(f"Unknown MaskWeightConfig.mode={self.mode!r}.")
         if not 0.0 <= self.mask_dropout_p <= 1.0:
             raise ValueError("mask_dropout_p must be in [0, 1].")
+        if not 0.0 <= self.reliability_min_area <= 1.0:
+            raise ValueError("reliability_min_area must be in [0, 1].")
+        if not 0.0 <= self.reliability_max_area <= 1.0:
+            raise ValueError("reliability_max_area must be in [0, 1].")
+        if self.reliability_min_area > self.reliability_max_area:
+            raise ValueError("reliability_min_area must be <= reliability_max_area.")
+        if not 0.0 <= self.reliability_floor <= 1.0:
+            raise ValueError("reliability_floor must be in [0, 1].")
+        if self.region_attention_heads <= 0:
+            raise ValueError("region_attention_heads must be positive.")
+        if not 0.0 <= self.region_attention_dropout <= 1.0:
+            raise ValueError("region_attention_dropout must be in [0, 1].")
+        if not 0.0 <= self.region_attention_context_weight <= 1.0:
+            raise ValueError("region_attention_context_weight must be in [0, 1].")
+        if not 0.0 <= self.region_attention_background_weight <= 1.0:
+            raise ValueError("region_attention_background_weight must be in [0, 1].")
+        if not 0.0 <= self.mask_noise_p <= 1.0:
+            raise ValueError("mask_noise_p must be in [0, 1].")
+        if self.mask_noise_jitter_px < 0:
+            raise ValueError("mask_noise_jitter_px must be non-negative.")
+        if not 0.0 <= self.mask_noise_confidence_min <= 1.0:
+            raise ValueError("mask_noise_confidence_min must be in [0, 1].")
+        if not 0.0 <= self.mask_noise_dropout_p <= 1.0:
+            raise ValueError("mask_noise_dropout_p must be in [0, 1].")
         if not 0.0 <= self.background_aug_p <= 1.0:
             raise ValueError("background_aug_p must be in [0, 1].")
         if self.background_consistency_loss_weight < 0.0:

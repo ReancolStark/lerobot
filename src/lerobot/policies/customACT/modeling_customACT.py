@@ -571,12 +571,20 @@ class ACT(nn.Module):
                 )
 
         self.mask_weight_mode = getattr(config.mw_config, "mode", "adapter")
-        if self.config.use_mask_weight and self.mask_weight_mode not in {"adapter", "legacy_multiply"}:
+        if self.config.use_mask_weight and self.mask_weight_mode not in {
+            "region_attention",
+            "adapter",
+            "legacy_multiply",
+        }:
             raise ValueError(
                 f"Unknown mask_weight mode: {self.mask_weight_mode}. "
-                "Expected 'adapter' or 'legacy_multiply'."
+                "Expected 'region_attention', 'adapter', or 'legacy_multiply'."
             )
-        if self.config.image_features and self.config.use_mask_weight and self.mask_weight_mode == "adapter":
+        if (
+            self.config.image_features
+            and self.config.use_mask_weight
+            and self.mask_weight_mode in {"region_attention", "adapter"}
+        ):
             self.mask_guided_visual_adapter = MaskGuidedVisualAdapter(config.dim_model, config.mw_config)
         
 
@@ -954,7 +962,7 @@ class ACT(nn.Module):
                 # 投影features到指定维度
                 cam_features = self.encoder_img_feat_input_proj(cam_features)    # [8, 512, 15, 20] -> [8, 512, 15, 20]
 
-                if self.config.use_mask_weight and self.mask_weight_mode == "adapter":
+                if self.config.use_mask_weight and self.mask_weight_mode in {"region_attention", "adapter"}:
                     target_h, target_w = cam_features.shape[-2:]
                     mask_resized = torch.nn.functional.interpolate(
                         yolo_mask,

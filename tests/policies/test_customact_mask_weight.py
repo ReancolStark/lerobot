@@ -10,7 +10,7 @@ from lerobot.policies.customACT.mask_weight.mask_weight import (
 
 def test_mask_guided_visual_adapter_shapes_and_gradient():
     torch.manual_seed(0)
-    config = MaskWeightConfig(adapter_hidden_dim=4, mask_dropout_p=0.0, use_target_tokens=False)
+    config = MaskWeightConfig(adapter_hidden_dim=4, mask_dropout_p=0.0, mask_noise_p=0.0, use_target_tokens=False)
     adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
 
     features = torch.randn(2, 8, 5, 6, requires_grad=True)
@@ -27,9 +27,13 @@ def test_mask_guided_visual_adapter_shapes_and_gradient():
     assert adapter.latest_debug["target_background_rms_ratio_gain"] > 0.0
     assert adapter.latest_debug["target_delta_ratio"] >= 0.0
     assert adapter.latest_debug["background_delta_ratio"] >= 0.0
+    assert adapter.latest_debug["reliability_mean"] > 0.0
+    assert adapter.latest_debug["region_attention_delta_ratio"] >= 0.0
+    assert adapter.latest_debug["region_attention_gate"] == pytest.approx(config.region_attention_gate_init)
 
     guided_features.mean().backward()
     assert adapter.gate_scale.grad is not None
+    assert adapter.region_attention_scale.grad is not None
 
 
 def test_mask_guided_visual_adapter_target_tokens():
@@ -37,6 +41,7 @@ def test_mask_guided_visual_adapter_target_tokens():
     config = MaskWeightConfig(
         adapter_hidden_dim=4,
         mask_dropout_p=0.0,
+        mask_noise_p=0.0,
         use_target_tokens=True,
         num_target_tokens=3,
     )
@@ -66,6 +71,39 @@ def test_mask_weight_config_rejects_invalid_background_strength():
             background_consistency_aug_min_strength=0.9,
             background_consistency_aug_max_strength=0.2,
         )
+
+
+def test_mask_weight_config_rejects_invalid_v4_params():
+    with pytest.raises(ValueError):
+        MaskWeightConfig(reliability_min_area=0.8, reliability_max_area=0.2)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(region_attention_heads=0)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(mask_noise_jitter_px=-1)
+
+
+def test_region_attention_reliability_gate_falls_back_on_empty_mask():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        mode="region_attention",
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        use_target_tokens=False,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+    adapter.eval()
+
+    features = torch.randn(2, 8, 5, 6)
+    mask = torch.zeros(2, 1, 5, 6)
+
+    guided_features, target_tokens, target_pos_embed = adapter(features, mask)
+
+    assert torch.allclose(guided_features, features)
+    assert target_tokens is None
+    assert target_pos_embed is None
+    assert adapter.latest_debug["reliability_mean"] == pytest.approx(0.0)
+    assert adapter.latest_debug["region_attention_delta_ratio"] == pytest.approx(0.0)
 
 
 def test_mask_guided_background_augmentation_preserves_target_and_changes_background():
