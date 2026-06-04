@@ -239,6 +239,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self.config = config
         self.dim_model = dim_model
         self.latest_debug: dict[str, float] = {}
+        self.latest_consistency: dict[str, torch.Tensor] = {}
 
         hidden_dim = int(config.adapter_hidden_dim)
         if config.use_spatial_embedding:
@@ -405,7 +406,8 @@ class MaskGuidedVisualAdapter(nn.Module):
         reliability = torch.clamp(confidence_score * area_score, 0.0, 1.0)
         floor = float(self.config.reliability_floor)
         if floor > 0.0:
-            reliability = floor + (1.0 - floor) * reliability
+            reliability_with_floor = floor + (1.0 - floor) * reliability
+            reliability = torch.where(area > 0.0, reliability_with_floor, torch.zeros_like(reliability))
         return reliability, confidence_score, area
 
     def _build_guidance(
@@ -468,6 +470,17 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_tokens = target_tokens + self.target_token_proj(target_tokens)
         target_pos_embed = self.target_token_pos_embed.to(dtype=features.dtype, device=features.device)
         return target_tokens, target_pos_embed
+
+    def _make_consistency_data(
+        self,
+        guided_features: torch.Tensor,
+        target_mask: torch.Tensor,
+        target_tokens: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        data = {"target_feature": self._masked_pool(guided_features, target_mask)}
+        if target_tokens is not None:
+            data["target_tokens"] = target_tokens
+        return data
 
     def _make_region_tokens(
         self,
@@ -569,6 +582,7 @@ class MaskGuidedVisualAdapter(nn.Module):
             context_mask,
             background_mask,
         )
+        self.latest_consistency = self._make_consistency_data(guided_features, target_mask, target_tokens)
         if not record_debug:
             self.latest_debug = {}
             return guided_features, target_tokens, target_pos_embed

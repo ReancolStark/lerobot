@@ -8,6 +8,22 @@ from lerobot.policies.customACT.mask_weight.mask_weight import (
 )
 
 
+def test_mask_weight_config_v4_direct_defaults():
+    config = MaskWeightConfig()
+
+    assert config.use_target_tokens is True
+    assert config.num_target_tokens == 2
+    assert config.gate_init == pytest.approx(0.2)
+    assert config.region_attention_gate_init == pytest.approx(0.2)
+    assert config.region_attention_context_weight == pytest.approx(0.3)
+    assert config.region_attention_background_weight == pytest.approx(0.0)
+    assert config.reliability_floor == pytest.approx(0.6)
+    assert config.mask_noise_p == pytest.approx(0.02)
+    assert config.mask_noise_dropout_p == pytest.approx(0.0)
+    assert config.background_feature_consistency_loss_weight == pytest.approx(0.03)
+    assert config.background_token_consistency_loss_weight == pytest.approx(0.03)
+
+
 def test_mask_guided_visual_adapter_shapes_and_gradient():
     torch.manual_seed(0)
     config = MaskWeightConfig(adapter_hidden_dim=4, mask_dropout_p=0.0, mask_noise_p=0.0, use_target_tokens=False)
@@ -56,6 +72,8 @@ def test_mask_guided_visual_adapter_target_tokens():
     assert guided_features.shape == features.shape
     assert target_tokens.shape == (3, 2, 8)
     assert target_pos_embed.shape == (3, 1, 8)
+    assert adapter.latest_consistency["target_feature"].shape == (2, 8)
+    assert adapter.latest_consistency["target_tokens"].shape == (3, 2, 8)
 
 
 def test_mask_weight_config_rejects_invalid_background_strength():
@@ -75,6 +93,10 @@ def test_mask_weight_config_rejects_invalid_v4_params():
         MaskWeightConfig(region_attention_heads=0)
     with pytest.raises(ValueError):
         MaskWeightConfig(mask_noise_jitter_px=-1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(background_feature_consistency_loss_weight=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(background_token_consistency_loss_weight=-0.1)
 
 
 def test_region_attention_reliability_gate_falls_back_on_empty_mask():

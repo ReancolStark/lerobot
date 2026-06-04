@@ -194,6 +194,7 @@ class ACTPolicy(PreTrainedPolicy):
             else {}
         )
         mask_weight_masks = dict(getattr(self.model, "latest_mask_weight_masks", None) or {})
+        mask_weight_consistency_refs = dict(getattr(self.model, "latest_mask_weight_consistency", None) or {})
         background_debug: dict[str, float | bool] = {}
         if self._should_use_mask_weight_background_consistency():
             augmented = self._build_mask_weight_background_augmented_batch(batch, mask_weight_masks)
@@ -204,17 +205,30 @@ class ACTPolicy(PreTrainedPolicy):
                     aug_batch[_ACT_FORCED_LATENT_SAMPLE] = latent_sample.detach()
 
                 actions_aug, _ = self.model(aug_batch)
+                mask_weight_consistency_aug = dict(
+                    getattr(self.model, "latest_mask_weight_consistency", None) or {}
+                )
 
                 # Keep debug/Rerun data from the real image path; the augmented pass
                 # is only a training constraint.
                 self.model.latest_mask_weight_debug = dict(mask_weight_debug)
                 self.model.latest_mask_weight_masks = dict(mask_weight_masks)
+                self.model.latest_mask_weight_consistency = self._detach_mask_weight_consistency(
+                    mask_weight_consistency_refs
+                )
 
                 action_delta = F.l1_loss(actions_aug, actions_hat.detach(), reduction="none")
                 valid_action = ~batch["action_is_pad"].unsqueeze(-1)
                 consistency_loss = (action_delta * valid_action).mean()
                 consistency_weight = float(self.config.mw_config.background_consistency_loss_weight)
                 loss = loss + consistency_loss * consistency_weight
+                representation_loss, representation_debug = self._compute_mask_weight_representation_consistency(
+                    mask_weight_consistency_refs,
+                    mask_weight_consistency_aug,
+                    record_debug=record_mask_weight_debug,
+                )
+                if representation_loss is not None:
+                    loss = loss + representation_loss
 
                 if record_mask_weight_debug:
                     masked_delta = action_delta.detach() * valid_action
@@ -236,6 +250,7 @@ class ACTPolicy(PreTrainedPolicy):
                     background_debug["mask_weight/consistency/action_delta_l1"] = action_delta_l1_value
                     background_debug["mask_weight/consistency/action_delta_max"] = action_delta_max_value
                     background_debug["mask_weight/consistency/latent_reused"] = float(latent_sample is not None)
+                    background_debug.update(representation_debug)
             elif record_mask_weight_debug:
                 background_debug = {
                     "mask_weight/bg_aug/enabled": True,
@@ -248,10 +263,38 @@ class ACTPolicy(PreTrainedPolicy):
         if background_debug:
             loss_dict.update(background_debug)
 
+        if mask_weight_consistency_refs:
+            self.model.latest_mask_weight_consistency = self._detach_mask_weight_consistency(
+                mask_weight_consistency_refs
+            )
+
         return loss, loss_dict
 
     def _should_record_mask_weight_debug(self) -> bool:
         return self.config.use_mask_weight and bool(getattr(self.config.mw_config, "record_debug_log", True))
+
+    def _mask_weight_background_consistency_weight_sum(self) -> float:
+        mw_config = self.config.mw_config
+        return (
+            max(0.0, float(getattr(mw_config, "background_consistency_loss_weight", 0.0)))
+            + max(0.0, float(getattr(mw_config, "background_feature_consistency_loss_weight", 0.0)))
+            + max(0.0, float(getattr(mw_config, "background_token_consistency_loss_weight", 0.0)))
+        )
+
+    @staticmethod
+    def _detach_mask_weight_consistency(
+        consistency: dict[str, dict[str, Tensor]],
+    ) -> dict[str, dict[str, Tensor]]:
+        detached: dict[str, dict[str, Tensor]] = {}
+        for img_key, data in consistency.items():
+            if not isinstance(data, dict):
+                continue
+            detached[img_key] = {
+                name: value.detach()
+                for name, value in data.items()
+                if isinstance(value, Tensor)
+            }
+        return detached
 
     def _should_use_mask_weight_background_consistency(self) -> bool:
         mw_config = self.config.mw_config
@@ -262,9 +305,80 @@ class ACTPolicy(PreTrainedPolicy):
             and mw_config.use_background_augmentation
             and mw_config.use_background_consistency
             and mw_config.background_aug_p > 0.0
-            and mw_config.background_consistency_loss_weight > 0.0
+            and self._mask_weight_background_consistency_weight_sum() > 0.0
             and getattr(self.model, "preprocessor", None) is not None
         )
+
+    def _compute_mask_weight_representation_consistency(
+        self,
+        reference: dict[str, dict[str, Tensor]],
+        augmented: dict[str, dict[str, Tensor]],
+        record_debug: bool,
+    ) -> tuple[Tensor | None, dict[str, float]]:
+        mw_config = self.config.mw_config
+        feature_weight = float(getattr(mw_config, "background_feature_consistency_loss_weight", 0.0))
+        token_weight = float(getattr(mw_config, "background_token_consistency_loss_weight", 0.0))
+        total_loss: Tensor | None = None
+        debug: dict[str, float] = {}
+
+        def _add_loss(current: Tensor | None, term: Tensor) -> Tensor:
+            return term if current is None else current + term
+
+        if feature_weight > 0.0:
+            feature_losses = []
+            for img_key, ref_data in reference.items():
+                aug_data = augmented.get(img_key, {})
+                ref_feature = ref_data.get("target_feature") if isinstance(ref_data, dict) else None
+                aug_feature = aug_data.get("target_feature") if isinstance(aug_data, dict) else None
+                if (
+                    isinstance(ref_feature, Tensor)
+                    and isinstance(aug_feature, Tensor)
+                    and ref_feature.shape == aug_feature.shape
+                ):
+                    feature_losses.append(F.l1_loss(aug_feature, ref_feature.detach()))
+
+            if feature_losses:
+                feature_loss = torch.stack(feature_losses).mean()
+                total_loss = _add_loss(total_loss, feature_loss * feature_weight)
+                if record_debug:
+                    debug["mask_weight/consistency/feature_loss"] = float(feature_loss.detach().item())
+                    debug["mask_weight/consistency/feature_weight"] = feature_weight
+                    debug["mask_weight/consistency/feature_weighted_loss"] = float(
+                        (feature_loss.detach() * feature_weight).item()
+                    )
+                    debug["mask_weight/consistency/feature_pairs"] = float(len(feature_losses))
+            elif record_debug:
+                debug["mask_weight/consistency/feature_weight"] = feature_weight
+                debug["mask_weight/consistency/feature_pairs"] = 0.0
+
+        if token_weight > 0.0:
+            token_losses = []
+            for img_key, ref_data in reference.items():
+                aug_data = augmented.get(img_key, {})
+                ref_tokens = ref_data.get("target_tokens") if isinstance(ref_data, dict) else None
+                aug_tokens = aug_data.get("target_tokens") if isinstance(aug_data, dict) else None
+                if (
+                    isinstance(ref_tokens, Tensor)
+                    and isinstance(aug_tokens, Tensor)
+                    and ref_tokens.shape == aug_tokens.shape
+                ):
+                    token_losses.append(F.l1_loss(aug_tokens, ref_tokens.detach()))
+
+            if token_losses:
+                token_loss = torch.stack(token_losses).mean()
+                total_loss = _add_loss(total_loss, token_loss * token_weight)
+                if record_debug:
+                    debug["mask_weight/consistency/token_loss"] = float(token_loss.detach().item())
+                    debug["mask_weight/consistency/token_weight"] = token_weight
+                    debug["mask_weight/consistency/token_weighted_loss"] = float(
+                        (token_loss.detach() * token_weight).item()
+                    )
+                    debug["mask_weight/consistency/token_pairs"] = float(len(token_losses))
+            elif record_debug:
+                debug["mask_weight/consistency/token_weight"] = token_weight
+                debug["mask_weight/consistency/token_pairs"] = 0.0
+
+        return total_loss, debug
 
     def _build_mask_weight_background_augmented_batch(
         self,
@@ -506,6 +620,7 @@ class ACT(nn.Module):
         self.debug_yolo_call_count = 0
         self.latest_mask_weight_debug: dict[str, float | str | bool] = {}
         self.latest_mask_weight_masks: dict[str, Tensor] = {}
+        self.latest_mask_weight_consistency: dict[str, dict[str, Tensor]] = {}
         self.latest_latent_sample: Tensor | None = None
 
         print('------customACT------') # customACT标记
@@ -737,6 +852,7 @@ class ACT(nn.Module):
             self.latest_yolo_debug_overlays = {}
         self.latest_mask_weight_debug = {}
         self.latest_mask_weight_masks = {}
+        self.latest_mask_weight_consistency = {}
 
         # Prepare the latent for input to the transformer encoder.
         if forced_latent_sample is not None:
@@ -939,6 +1055,9 @@ class ACT(nn.Module):
                         cam_features,
                         mask_resized,
                         record_debug=not skip_mask_weight_debug,
+                    )
+                    self.latest_mask_weight_consistency[img_key] = dict(
+                        getattr(self.mask_guided_visual_adapter, "latest_consistency", {}) or {}
                     )
                     if not skip_mask_weight_debug:
                         cam_name = img_key.replace(f"{OBS_IMAGES}.", "")

@@ -6,13 +6,13 @@ class MaskWeightConfig:
     # V4 mask-guided adapter switches.
     use_spatial_embedding: bool = True
     use_residual_gate: bool = True
-    use_target_tokens: bool = False
+    use_target_tokens: bool = True
     use_region_attention: bool = True
     use_reliability_gate: bool = True
 
     # Mask-guided adapter hyperparameters.
     adapter_hidden_dim: int = 128
-    gate_init: float = 0.1
+    gate_init: float = 0.2
     context_dilation: int = 3
     mask_dropout_p: float = 0.1
     num_target_tokens: int = 2
@@ -26,28 +26,30 @@ class MaskWeightConfig:
     # mask-guided residual path is weakened and the policy falls back toward ACT.
     reliability_min_area: float = 0.002
     reliability_max_area: float = 0.65
-    reliability_floor: float = 0.0
+    reliability_floor: float = 0.6
 
     # V4 region cross-attention.
     region_attention_heads: int = 4
     region_attention_dropout: float = 0.0
-    region_attention_gate_init: float = 0.1
-    region_attention_context_weight: float = 0.5
-    region_attention_background_weight: float = 0.1
+    region_attention_gate_init: float = 0.2
+    region_attention_context_weight: float = 0.3
+    region_attention_background_weight: float = 0.0
 
     # V4 mask corruption during training. This teaches the policy not to trust
     # YOLO as a perfect sensor while keeping the original RGB path intact.
-    mask_noise_p: float = 0.1
+    mask_noise_p: float = 0.02
     mask_noise_jitter_px: int = 1
     mask_noise_confidence_min: float = 0.5
-    mask_noise_dropout_p: float = 0.1
+    mask_noise_dropout_p: float = 0.0
 
-    # Training-time background counterfactuals. These are off by default because
-    # consistency training requires an extra policy forward pass.
+    # Training-time background counterfactuals. The auxiliary forward keeps the
+    # original RGB inference path intact while making background dependence costly.
     use_background_augmentation: bool = True
     use_background_consistency: bool = True
     background_aug_p: float = 0.5
     background_consistency_loss_weight: float = 0.1
+    background_feature_consistency_loss_weight: float = 0.03
+    background_token_consistency_loss_weight: float = 0.03
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05
     background_aug_mode: str = "mixed"  # "random_color", "noise", "mixed", or "shuffle".
@@ -96,6 +98,10 @@ class MaskWeightConfig:
             raise ValueError("background_aug_p must be in [0, 1].")
         if self.background_consistency_loss_weight < 0.0:
             raise ValueError("background_consistency_loss_weight must be non-negative.")
+        if self.background_feature_consistency_loss_weight < 0.0:
+            raise ValueError("background_feature_consistency_loss_weight must be non-negative.")
+        if self.background_token_consistency_loss_weight < 0.0:
+            raise ValueError("background_token_consistency_loss_weight must be non-negative.")
         if self.background_aug_context_dilation < 0:
             raise ValueError("background_aug_context_dilation must be non-negative.")
         if not 0.0 <= self.background_aug_keep_threshold <= 1.0:
