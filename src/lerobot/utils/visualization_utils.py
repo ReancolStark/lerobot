@@ -21,6 +21,8 @@ import rerun as rr
 
 from .constants import OBS_PREFIX, OBS_STR
 
+RERUN_PORT: int | None = 11000
+
 
 def init_rerun(session_name: str = "lerobot_control_loop") -> None:
     """Initializes the Rerun SDK for visualizing the control loop."""
@@ -28,7 +30,10 @@ def init_rerun(session_name: str = "lerobot_control_loop") -> None:
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
     rr.init(session_name)
     memory_limit = os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
-    rr.spawn(memory_limit=memory_limit)
+    spawn_kwargs: dict[str, Any] = {"memory_limit": memory_limit}
+    if RERUN_PORT is not None:
+        spawn_kwargs["port"] = RERUN_PORT
+    rr.spawn(**spawn_kwargs)
 
 
 def _is_scalar(x):
