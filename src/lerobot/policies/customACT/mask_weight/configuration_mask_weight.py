@@ -5,8 +5,9 @@ from dataclasses import dataclass
 class MaskWeightConfig:
     # V4 mask-guided adapter switches.
     use_spatial_embedding: bool = True
-    use_residual_gate: bool = True
+    use_residual_gate: bool = False
     use_target_tokens: bool = True
+    use_mask_geometry_token: bool = True
     use_region_attention: bool = True
     use_reliability_gate: bool = True
 
@@ -16,6 +17,15 @@ class MaskWeightConfig:
     context_dilation: int = 3
     mask_dropout_p: float = 0.1
     num_target_tokens: int = 2
+    use_target_token_attention: bool = True
+    target_token_attention_heads: int = 4
+    target_token_attention_dropout: float = 0.0
+    target_token_attention_gate_init: float = 0.2
+    target_token_mask_bias_scale: float = 2.0
+    target_object_perceiver_layers: int = 2
+    target_object_perceiver_ffn_dim: int = 1024
+    target_object_perceiver_dropout: float = 0.0
+    mask_geometry_token_gate_init: float = 0.2
 
     # YOLO mask post-processing.
     mask_blur_kernel_size: int = 7
@@ -37,7 +47,7 @@ class MaskWeightConfig:
 
     # V4 mask corruption during training. This teaches the policy not to trust
     # YOLO as a perfect sensor while keeping the original RGB path intact.
-    mask_noise_p: float = 0.02
+    mask_noise_p: float = 0.0
     mask_noise_jitter_px: int = 1
     mask_noise_confidence_min: float = 0.5
     mask_noise_dropout_p: float = 0.0
@@ -50,6 +60,8 @@ class MaskWeightConfig:
     background_consistency_loss_weight: float = 0.1
     background_feature_consistency_loss_weight: float = 0.03
     background_token_consistency_loss_weight: float = 0.03
+    target_background_contrastive_loss_weight: float = 0.02
+    target_background_contrastive_margin: float = 0.2
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05
     background_aug_mode: str = "mixed"  # "random_color", "noise", "mixed", or "shuffle".
@@ -70,6 +82,18 @@ class MaskWeightConfig:
     def __post_init__(self):
         if not 0.0 <= self.mask_dropout_p <= 1.0:
             raise ValueError("mask_dropout_p must be in [0, 1].")
+        if self.target_token_attention_heads <= 0:
+            raise ValueError("target_token_attention_heads must be positive.")
+        if not 0.0 <= self.target_token_attention_dropout <= 1.0:
+            raise ValueError("target_token_attention_dropout must be in [0, 1].")
+        if self.target_token_mask_bias_scale < 0.0:
+            raise ValueError("target_token_mask_bias_scale must be non-negative.")
+        if self.target_object_perceiver_layers <= 0:
+            raise ValueError("target_object_perceiver_layers must be positive.")
+        if self.target_object_perceiver_ffn_dim <= 0:
+            raise ValueError("target_object_perceiver_ffn_dim must be positive.")
+        if not 0.0 <= self.target_object_perceiver_dropout <= 1.0:
+            raise ValueError("target_object_perceiver_dropout must be in [0, 1].")
         if not 0.0 <= self.reliability_min_area <= 1.0:
             raise ValueError("reliability_min_area must be in [0, 1].")
         if not 0.0 <= self.reliability_max_area <= 1.0:
@@ -102,6 +126,10 @@ class MaskWeightConfig:
             raise ValueError("background_feature_consistency_loss_weight must be non-negative.")
         if self.background_token_consistency_loss_weight < 0.0:
             raise ValueError("background_token_consistency_loss_weight must be non-negative.")
+        if self.target_background_contrastive_loss_weight < 0.0:
+            raise ValueError("target_background_contrastive_loss_weight must be non-negative.")
+        if self.target_background_contrastive_margin < 0.0:
+            raise ValueError("target_background_contrastive_margin must be non-negative.")
         if self.background_aug_context_dilation < 0:
             raise ValueError("background_aug_context_dilation must be non-negative.")
         if not 0.0 <= self.background_aug_keep_threshold <= 1.0:
@@ -130,3 +158,5 @@ class MaskWeightConfig:
             raise ValueError("context_dilation must be non-negative.")
         if self.num_target_tokens < 0:
             raise ValueError("num_target_tokens must be non-negative.")
+        if self.mask_geometry_token_gate_init < 0.0:
+            raise ValueError("mask_geometry_token_gate_init must be non-negative.")

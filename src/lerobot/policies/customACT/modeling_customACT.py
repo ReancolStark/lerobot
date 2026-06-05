@@ -196,6 +196,13 @@ class ACTPolicy(PreTrainedPolicy):
         mask_weight_masks = dict(getattr(self.model, "latest_mask_weight_masks", None) or {})
         mask_weight_consistency_refs = dict(getattr(self.model, "latest_mask_weight_consistency", None) or {})
         background_debug: dict[str, float | bool] = {}
+        target_token_loss, target_token_debug = self._compute_mask_weight_target_token_contrastive(
+            mask_weight_consistency_refs,
+            record_debug=record_mask_weight_debug,
+        )
+        if target_token_loss is not None:
+            loss = loss + target_token_loss
+
         if self._should_use_mask_weight_background_consistency():
             augmented = self._build_mask_weight_background_augmented_batch(batch, mask_weight_masks)
             if augmented is not None:
@@ -262,6 +269,8 @@ class ACTPolicy(PreTrainedPolicy):
             loss_dict.update(mask_weight_debug)
         if background_debug:
             loss_dict.update(background_debug)
+        if target_token_debug:
+            loss_dict.update(target_token_debug)
 
         if mask_weight_consistency_refs:
             self.model.latest_mask_weight_consistency = self._detach_mask_weight_consistency(
@@ -295,6 +304,74 @@ class ACTPolicy(PreTrainedPolicy):
                 if isinstance(value, Tensor)
             }
         return detached
+
+    def _compute_mask_weight_target_token_contrastive(
+        self,
+        consistency: dict[str, dict[str, Tensor]],
+        record_debug: bool,
+    ) -> tuple[Tensor | None, dict[str, float]]:
+        mw_config = self.config.mw_config
+        weight = float(getattr(mw_config, "target_background_contrastive_loss_weight", 0.0))
+        margin = float(getattr(mw_config, "target_background_contrastive_margin", 0.0))
+        if (
+            not self.training
+            or not self.config.use_mask_weight
+            or weight <= 0.0
+            or not consistency
+        ):
+            return None, {}
+
+        losses = []
+        target_cosines = []
+        background_cosines = []
+        for data in consistency.values():
+            if not isinstance(data, dict):
+                continue
+            target_tokens = data.get("target_tokens")
+            target_feature = data.get("target_feature")
+            background_feature = data.get("background_feature")
+            if (
+                not isinstance(target_tokens, Tensor)
+                or not isinstance(target_feature, Tensor)
+                or not isinstance(background_feature, Tensor)
+                or target_tokens.ndim != 3
+                or target_tokens.shape[0] < 1
+            ):
+                continue
+
+            target_token = target_tokens[0]
+            if target_token.shape != target_feature.shape or target_token.shape != background_feature.shape:
+                continue
+
+            target_cosine = F.cosine_similarity(target_token, target_feature.detach(), dim=-1)
+            background_cosine = F.cosine_similarity(target_token, background_feature.detach(), dim=-1)
+            losses.append(F.relu(margin + background_cosine - target_cosine).mean())
+            target_cosines.append(target_cosine.detach().mean())
+            background_cosines.append(background_cosine.detach().mean())
+
+        if not losses:
+            if record_debug:
+                return None, {
+                    "mask_weight/target_token/contrastive_weight": weight,
+                    "mask_weight/target_token/contrastive_pairs": 0.0,
+                }
+            return None, {}
+
+        contrastive_loss = torch.stack(losses).mean()
+        weighted_loss = contrastive_loss * weight
+        if not record_debug:
+            return weighted_loss, {}
+
+        debug = {
+            "mask_weight/target_token/contrastive_loss": float(contrastive_loss.detach().item()),
+            "mask_weight/target_token/contrastive_weight": weight,
+            "mask_weight/target_token/contrastive_weighted_loss": float(weighted_loss.detach().item()),
+            "mask_weight/target_token/contrastive_margin": margin,
+            "mask_weight/target_token/contrastive_pairs": float(len(losses)),
+            "mask_weight/target_token/target_cosine": float(torch.stack(target_cosines).mean().item()),
+            "mask_weight/target_token/background_cosine": float(torch.stack(background_cosines).mean().item()),
+        }
+        return weighted_loss, debug
 
     def _should_use_mask_weight_background_consistency(self) -> bool:
         mw_config = self.config.mw_config
@@ -989,6 +1066,8 @@ class ACT(nn.Module):
                 imgs_for_yolo = None
                 target_tokens = None
                 target_pos_embed = None
+                mask_geometry_token = None
+                mask_geometry_pos_embed = None
 
                 if self.config.use_mask_weight:
                     forced_yolo_mask = (
@@ -1051,7 +1130,13 @@ class ACT(nn.Module):
                     )
                     mask_resized = mask_resized.to(dtype=cam_features.dtype, device=cam_features.device)
                     mask_resized = torch.clamp(mask_resized, 0.0, 1.0)
-                    cam_features, target_tokens, target_pos_embed = self.mask_guided_visual_adapter(
+                    (
+                        cam_features,
+                        target_tokens,
+                        target_pos_embed,
+                        mask_geometry_token,
+                        mask_geometry_pos_embed,
+                    ) = self.mask_guided_visual_adapter(
                         cam_features,
                         mask_resized,
                         record_debug=not skip_mask_weight_debug,
@@ -1075,6 +1160,10 @@ class ACT(nn.Module):
                             self.latest_mask_weight_debug[f"mask_weight/{cam_name}/target_tokens"] = float(
                                 target_tokens.shape[0]
                             )
+                        if mask_geometry_token is not None:
+                            self.latest_mask_weight_debug[f"mask_weight/{cam_name}/mask_geometry_tokens"] = float(
+                                mask_geometry_token.shape[0]
+                            )
 
 
                 # 重新排列features形状
@@ -1088,6 +1177,9 @@ class ACT(nn.Module):
                 if target_tokens is not None:
                     encoder_in_tokens.extend(list(target_tokens))
                     encoder_in_pos_embed.extend(list(target_pos_embed))
+                if mask_geometry_token is not None:
+                    encoder_in_tokens.extend(list(mask_geometry_token))
+                    encoder_in_pos_embed.extend(list(mask_geometry_pos_embed))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)

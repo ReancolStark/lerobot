@@ -145,8 +145,10 @@ def _collect_mask_weight_grad_debug(policy: PreTrainedPolicy) -> dict[str, float
             group = "mask_encoder"
         elif name.startswith("feature_adapter"):
             group = "feature_adapter"
-        elif name.startswith("target_token"):
+        elif name.startswith("target_token") or name.startswith("target_object_perceiver"):
             group = "target_tokens"
+        elif name.startswith("mask_geometry_token"):
+            group = "mask_geometry_token"
         elif name.startswith("region_"):
             group = "region_attention"
         elif name == "gate_scale":
