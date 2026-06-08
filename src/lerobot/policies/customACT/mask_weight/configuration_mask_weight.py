@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class MaskWeightConfig:
     # V4 mask-guided adapter switches.
     use_spatial_embedding: bool = True
-    use_residual_gate: bool = False
+    use_residual_gate: bool = True
     use_target_tokens: bool = True
     use_mask_geometry_token: bool = True
     use_region_attention: bool = True
@@ -13,7 +13,7 @@ class MaskWeightConfig:
 
     # Mask-guided adapter hyperparameters.
     adapter_hidden_dim: int = 128
-    gate_init: float = 0.2
+    gate_init: float = 0.05
     context_dilation: int = 3
     mask_dropout_p: float = 0.1
     num_target_tokens: int = 2
@@ -60,7 +60,7 @@ class MaskWeightConfig:
     background_consistency_loss_weight: float = 0.1
     background_feature_consistency_loss_weight: float = 0.03
     background_token_consistency_loss_weight: float = 0.03
-    target_background_contrastive_loss_weight: float = 0.02
+    target_background_contrastive_loss_weight: float = 0.01
     target_background_contrastive_margin: float = 0.2
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05

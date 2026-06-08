@@ -14,11 +14,11 @@ from lerobot.policies.customACT.mask_weight.mask_weight import (
 def test_mask_weight_config_v4_direct_defaults():
     config = MaskWeightConfig()
 
-    assert config.use_residual_gate is False
+    assert config.use_residual_gate is True
     assert config.use_target_tokens is True
     assert config.use_mask_geometry_token is True
     assert config.num_target_tokens == 2
-    assert config.gate_init == pytest.approx(0.2)
+    assert config.gate_init == pytest.approx(0.05)
     assert config.region_attention_gate_init == pytest.approx(0.2)
     assert config.region_attention_context_weight == pytest.approx(0.3)
     assert config.region_attention_background_weight == pytest.approx(0.0)
@@ -35,7 +35,7 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.target_object_perceiver_ffn_dim == 1024
     assert config.target_object_perceiver_dropout == pytest.approx(0.0)
     assert config.mask_geometry_token_gate_init == pytest.approx(0.2)
-    assert config.target_background_contrastive_loss_weight == pytest.approx(0.02)
+    assert config.target_background_contrastive_loss_weight == pytest.approx(0.01)
     assert config.target_background_contrastive_margin == pytest.approx(0.2)
 
 
