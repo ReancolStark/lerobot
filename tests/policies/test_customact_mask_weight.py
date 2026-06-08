@@ -14,11 +14,11 @@ from lerobot.policies.customACT.mask_weight.mask_weight import (
 def test_mask_weight_config_v4_direct_defaults():
     config = MaskWeightConfig()
 
-    assert config.use_residual_gate is False
+    assert config.use_residual_gate is True
     assert config.use_target_tokens is True
     assert config.use_mask_geometry_token is True
     assert config.num_target_tokens == 2
-    assert config.gate_init == pytest.approx(0.2)
+    assert config.gate_init == pytest.approx(0.05)
     assert config.region_attention_gate_init == pytest.approx(0.2)
     assert config.region_attention_context_weight == pytest.approx(0.3)
     assert config.region_attention_background_weight == pytest.approx(0.0)
@@ -34,9 +34,13 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.target_object_perceiver_layers == 2
     assert config.target_object_perceiver_ffn_dim == 1024
     assert config.target_object_perceiver_dropout == pytest.approx(0.0)
+    assert config.use_object_perceiver_geometry_bias is True
+    assert config.object_perceiver_geometry_bias_scale == pytest.approx(1.0)
+    assert config.object_perceiver_geometry_min_spread == pytest.approx(0.05)
     assert config.mask_geometry_token_gate_init == pytest.approx(0.2)
-    assert config.target_background_contrastive_loss_weight == pytest.approx(0.02)
-    assert config.target_background_contrastive_margin == pytest.approx(0.2)
+    assert config.target_background_contrastive_loss_weight == pytest.approx(0.03)
+    assert config.target_background_contrastive_margin == pytest.approx(0.5)
+    assert config.target_background_contrastive_temperature == pytest.approx(0.1)
 
 
 def test_mask_guided_visual_adapter_shapes_and_gradient():
@@ -109,6 +113,11 @@ def test_mask_guided_visual_adapter_target_tokens():
     assert adapter.latest_debug["target_token_attention_delta_ratio"] >= 0.0
     assert adapter.latest_debug["object_perceiver_delta_ratio"] >= 0.0
     assert adapter.latest_debug["object_perceiver_layers"] == pytest.approx(2.0)
+    assert adapter.latest_debug["object_perceiver_geometry_bias_mean"] > 0.0
+    assert adapter.latest_debug["object_perceiver_geometry_bias_rms"] > 0.0
+    assert adapter.latest_debug["object_perceiver_geometry_bias_scale"] == pytest.approx(
+        config.object_perceiver_geometry_bias_scale
+    )
     assert adapter.latest_debug["target_token_attention_gate"] == pytest.approx(
         config.target_token_attention_gate_init
     )
@@ -163,6 +172,10 @@ def test_mask_weight_config_rejects_invalid_v4_params():
     with pytest.raises(ValueError):
         MaskWeightConfig(target_object_perceiver_dropout=-0.1)
     with pytest.raises(ValueError):
+        MaskWeightConfig(object_perceiver_geometry_bias_scale=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_perceiver_geometry_min_spread=0.0)
+    with pytest.raises(ValueError):
         MaskWeightConfig(mask_geometry_token_gate_init=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(background_feature_consistency_loss_weight=-0.1)
@@ -172,6 +185,8 @@ def test_mask_weight_config_rejects_invalid_v4_params():
         MaskWeightConfig(target_background_contrastive_loss_weight=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(target_background_contrastive_margin=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_background_contrastive_temperature=0.0)
 
 
 def test_target_token_attention_can_be_disabled_for_ablation():
@@ -200,6 +215,8 @@ def test_target_token_attention_can_be_disabled_for_ablation():
     assert adapter.latest_debug["target_token_attention_delta_ratio"] == pytest.approx(0.0)
     assert adapter.latest_debug["object_perceiver_delta_ratio"] == pytest.approx(0.0)
     assert adapter.latest_debug["object_perceiver_layers"] == pytest.approx(0.0)
+    assert adapter.latest_debug["object_perceiver_geometry_bias_mean"] == pytest.approx(0.0)
+    assert adapter.latest_debug["object_perceiver_geometry_bias_rms"] == pytest.approx(0.0)
     assert adapter.latest_debug["target_token_geometry_norm"] == pytest.approx(0.0)
     assert adapter.latest_debug["mask_geometry_token_norm"] >= 0.0
 
@@ -286,6 +303,7 @@ def test_target_token_attention_does_not_inject_empty_mask():
     assert adapter.latest_debug["reliability_mean"] == pytest.approx(0.0)
     assert adapter.latest_debug["target_token_attention_delta_ratio"] == pytest.approx(0.0)
     assert adapter.latest_debug["object_perceiver_delta_ratio"] == pytest.approx(0.0)
+    assert adapter.latest_debug["object_perceiver_geometry_bias_rms"] == pytest.approx(0.0)
     assert adapter.latest_debug["target_token_geometry_norm"] == pytest.approx(0.0)
     assert adapter.latest_debug["mask_geometry_token_norm"] == pytest.approx(0.0)
 
@@ -296,9 +314,9 @@ def test_target_background_contrastive_loss_has_debug_metrics():
     policy.config = SimpleNamespace(use_mask_weight=True, mw_config=MaskWeightConfig())
     reference = {
         "cam": {
-            "target_tokens": torch.ones(2, 2, 4),
-            "target_feature": torch.ones(2, 4),
-            "background_feature": -torch.ones(2, 4),
+            "target_tokens": torch.tensor([[[1.0, 0.0], [1.0, 0.0]], [[0.0, 1.0], [0.0, 1.0]]]),
+            "target_feature": torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            "background_feature": torch.tensor([[0.4, 0.9165151], [0.4, 0.9165151]]),
         }
     }
 
@@ -306,7 +324,11 @@ def test_target_background_contrastive_loss_has_debug_metrics():
 
     assert loss is not None
     assert debug["mask_weight/target_token/contrastive_pairs"] == pytest.approx(1.0)
-    assert debug["mask_weight/target_token/contrastive_loss"] == pytest.approx(0.0)
+    assert debug["mask_weight/target_token/contrastive_loss"] > 0.0
+    assert debug["mask_weight/target_token/contrastive_margin"] == pytest.approx(0.5)
+    assert debug["mask_weight/target_token/contrastive_temperature"] == pytest.approx(0.1)
+    assert debug["mask_weight/target_token/contrastive_raw_margin"] < 0.0
+    assert debug["mask_weight/target_token/contrastive_active_ratio"] == pytest.approx(0.0)
     assert debug["mask_weight/target_token/target_cosine"] > debug["mask_weight/target_token/background_cosine"]
 
 

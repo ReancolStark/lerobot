@@ -313,15 +313,19 @@ class ACTPolicy(PreTrainedPolicy):
         mw_config = self.config.mw_config
         weight = float(getattr(mw_config, "target_background_contrastive_loss_weight", 0.0))
         margin = float(getattr(mw_config, "target_background_contrastive_margin", 0.0))
+        temperature = float(getattr(mw_config, "target_background_contrastive_temperature", 0.1))
         if (
             not self.training
             or not self.config.use_mask_weight
             or weight <= 0.0
+            or temperature <= 0.0
             or not consistency
         ):
             return None, {}
 
         losses = []
+        raw_margins = []
+        active_ratios = []
         target_cosines = []
         background_cosines = []
         for data in consistency.values():
@@ -345,7 +349,10 @@ class ACTPolicy(PreTrainedPolicy):
 
             target_cosine = F.cosine_similarity(target_token, target_feature.detach(), dim=-1)
             background_cosine = F.cosine_similarity(target_token, background_feature.detach(), dim=-1)
-            losses.append(F.relu(margin + background_cosine - target_cosine).mean())
+            raw_margin = margin + background_cosine - target_cosine
+            losses.append((F.softplus(raw_margin / temperature) * temperature).mean())
+            raw_margins.append(raw_margin.detach().mean())
+            active_ratios.append((raw_margin.detach() > 0.0).float().mean())
             target_cosines.append(target_cosine.detach().mean())
             background_cosines.append(background_cosine.detach().mean())
 
@@ -367,7 +374,10 @@ class ACTPolicy(PreTrainedPolicy):
             "mask_weight/target_token/contrastive_weight": weight,
             "mask_weight/target_token/contrastive_weighted_loss": float(weighted_loss.detach().item()),
             "mask_weight/target_token/contrastive_margin": margin,
+            "mask_weight/target_token/contrastive_temperature": temperature,
             "mask_weight/target_token/contrastive_pairs": float(len(losses)),
+            "mask_weight/target_token/contrastive_raw_margin": float(torch.stack(raw_margins).mean().item()),
+            "mask_weight/target_token/contrastive_active_ratio": float(torch.stack(active_ratios).mean().item()),
             "mask_weight/target_token/target_cosine": float(torch.stack(target_cosines).mean().item()),
             "mask_weight/target_token/background_cosine": float(torch.stack(background_cosines).mean().item()),
         }

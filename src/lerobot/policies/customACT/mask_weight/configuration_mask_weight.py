@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class MaskWeightConfig:
     # V4 mask-guided adapter switches.
     use_spatial_embedding: bool = True
-    use_residual_gate: bool = False
+    use_residual_gate: bool = True
     use_target_tokens: bool = True
     use_mask_geometry_token: bool = True
     use_region_attention: bool = True
@@ -13,7 +13,7 @@ class MaskWeightConfig:
 
     # Mask-guided adapter hyperparameters.
     adapter_hidden_dim: int = 128
-    gate_init: float = 0.2
+    gate_init: float = 0.05
     context_dilation: int = 3
     mask_dropout_p: float = 0.1
     num_target_tokens: int = 2
@@ -25,6 +25,9 @@ class MaskWeightConfig:
     target_object_perceiver_layers: int = 2
     target_object_perceiver_ffn_dim: int = 1024
     target_object_perceiver_dropout: float = 0.0
+    use_object_perceiver_geometry_bias: bool = True
+    object_perceiver_geometry_bias_scale: float = 1.0
+    object_perceiver_geometry_min_spread: float = 0.05
     mask_geometry_token_gate_init: float = 0.2
 
     # YOLO mask post-processing.
@@ -60,8 +63,9 @@ class MaskWeightConfig:
     background_consistency_loss_weight: float = 0.1
     background_feature_consistency_loss_weight: float = 0.03
     background_token_consistency_loss_weight: float = 0.03
-    target_background_contrastive_loss_weight: float = 0.02
-    target_background_contrastive_margin: float = 0.2
+    target_background_contrastive_loss_weight: float = 0.03
+    target_background_contrastive_margin: float = 0.5
+    target_background_contrastive_temperature: float = 0.1
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05
     background_aug_mode: str = "mixed"  # "random_color", "noise", "mixed", or "shuffle".
@@ -94,6 +98,10 @@ class MaskWeightConfig:
             raise ValueError("target_object_perceiver_ffn_dim must be positive.")
         if not 0.0 <= self.target_object_perceiver_dropout <= 1.0:
             raise ValueError("target_object_perceiver_dropout must be in [0, 1].")
+        if self.object_perceiver_geometry_bias_scale < 0.0:
+            raise ValueError("object_perceiver_geometry_bias_scale must be non-negative.")
+        if self.object_perceiver_geometry_min_spread <= 0.0:
+            raise ValueError("object_perceiver_geometry_min_spread must be positive.")
         if not 0.0 <= self.reliability_min_area <= 1.0:
             raise ValueError("reliability_min_area must be in [0, 1].")
         if not 0.0 <= self.reliability_max_area <= 1.0:
@@ -130,6 +138,8 @@ class MaskWeightConfig:
             raise ValueError("target_background_contrastive_loss_weight must be non-negative.")
         if self.target_background_contrastive_margin < 0.0:
             raise ValueError("target_background_contrastive_margin must be non-negative.")
+        if self.target_background_contrastive_temperature <= 0.0:
+            raise ValueError("target_background_contrastive_temperature must be positive.")
         if self.background_aug_context_dilation < 0:
             raise ValueError("background_aug_context_dilation must be non-negative.")
         if not 0.0 <= self.background_aug_keep_threshold <= 1.0:
