@@ -26,10 +26,15 @@ def _masked_recent_mean(values: Tensor, mask: Tensor, recent_steps: int) -> Tens
     return (values * mask_f).sum(dim=1) / denom
 
 
+def _last_true_indices(mask: Tensor) -> Tensor:
+    positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1)
+    return torch.where(mask, positions, torch.zeros_like(positions)).amax(dim=1)
+
+
 def _last_valid(history: Tensor, mask: Tensor) -> Tensor:
     batch_size, _, dim = history.shape
     lengths = mask.long().sum(dim=1)
-    gather_idx = (lengths - 1).clamp_min(0).view(batch_size, 1, 1).expand(batch_size, 1, dim)
+    gather_idx = _last_true_indices(mask).view(batch_size, 1, 1).expand(batch_size, 1, dim)
     values = history.gather(dim=1, index=gather_idx).squeeze(1)
     return torch.where(lengths.unsqueeze(-1) > 0, values, torch.zeros_like(values))
 
@@ -170,7 +175,7 @@ class HistoryTokenReplanScoreModel(nn.Module):
     def _masked_tail(x: Tensor, mask: Tensor) -> Tensor:
         batch_size, _, dim = x.shape
         lengths = mask.long().sum(dim=1)
-        gather_idx = (lengths - 1).clamp_min(0).view(batch_size, 1, 1).expand(batch_size, 1, dim)
+        gather_idx = _last_true_indices(mask).view(batch_size, 1, 1).expand(batch_size, 1, dim)
         tail = x.gather(dim=1, index=gather_idx).squeeze(1)
         return torch.where(lengths.unsqueeze(-1) > 0, tail, torch.zeros_like(tail))
 
