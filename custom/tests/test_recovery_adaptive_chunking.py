@@ -16,25 +16,25 @@ def _load_recovery_adaptive_classes():
         / "lerobot"
         / "policies"
         / "customACT"
-        / "recovery_adaptive_chunking"
+        / "replan_score_adaptive_chunking"
     )
 
     for name in [
         "lerobot",
         "lerobot.policies",
         "lerobot.policies.customACT",
-        "lerobot.policies.customACT.recovery_adaptive_chunking",
+        "lerobot.policies.customACT.replan_score_adaptive_chunking",
     ]:
         pkg = types.ModuleType(name)
         pkg.__path__ = []
         sys.modules[name] = pkg
 
     config_name = (
-        "lerobot.policies.customACT.recovery_adaptive_chunking."
-        "configuration_recovery_adaptive_chunking"
+        "lerobot.policies.customACT.replan_score_adaptive_chunking."
+        "configuration_history_token_replan_score"
     )
     config_spec = importlib.util.spec_from_file_location(
-        config_name, module_dir / "configuration_recovery_adaptive_chunking.py"
+        config_name, module_dir / "configuration_history_token_replan_score.py"
     )
     config_module = importlib.util.module_from_spec(config_spec)
     assert config_spec is not None and config_spec.loader is not None
@@ -42,11 +42,11 @@ def _load_recovery_adaptive_classes():
     config_spec.loader.exec_module(config_module)
 
     modeling_name = (
-        "lerobot.policies.customACT.recovery_adaptive_chunking."
-        "modeling_recovery_adaptive_chunking"
+        "lerobot.policies.customACT.replan_score_adaptive_chunking."
+        "modeling_history_token_replan_score"
     )
     modeling_spec = importlib.util.spec_from_file_location(
-        modeling_name, module_dir / "modeling_recovery_adaptive_chunking.py"
+        modeling_name, module_dir / "modeling_history_token_replan_score.py"
     )
     modeling_module = importlib.util.module_from_spec(modeling_spec)
     assert modeling_spec is not None and modeling_spec.loader is not None
@@ -58,9 +58,9 @@ def _load_recovery_adaptive_classes():
 def test_future_action_correction_increases_recovery_target():
     RecoveryAdaptiveChunkingConfig, modeling = _load_recovery_adaptive_classes()
     cfg = RecoveryAdaptiveChunkingConfig(
-        recovery_score_target_center=0.5,
-        recovery_score_target_temperature=0.2,
-        recovery_score_recent_steps=4,
+        replan_score_target_center=0.5,
+        replan_score_target_temperature=0.2,
+        replan_score_recent_steps=4,
     )
 
     B, H, K, D = 2, 8, 4, 3
@@ -96,8 +96,8 @@ def test_future_action_correction_increases_recovery_target():
 def test_recovery_score_loss_is_finite():
     RecoveryAdaptiveChunkingConfig, modeling = _load_recovery_adaptive_classes()
     cfg = RecoveryAdaptiveChunkingConfig(
-        recovery_score_target_center=0.5,
-        recovery_score_target_temperature=0.2,
+        replan_score_target_center=0.5,
+        replan_score_target_temperature=0.2,
     )
 
     B, H, K, D = 2, 8, 4, 3
@@ -129,8 +129,8 @@ def test_integrated_model_and_controller_shapes():
         num_segments=2,
         hidden_dim=16,
         conv_dilations=[1, 2],
-        recovery_score_target_center=0.5,
-        recovery_score_target_temperature=0.2,
+        replan_score_target_center=0.5,
+        replan_score_target_temperature=0.2,
         min_chunk_size=2,
         max_chunk_size=8,
     )

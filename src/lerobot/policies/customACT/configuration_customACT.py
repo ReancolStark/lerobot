@@ -20,10 +20,10 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.policies.customACT.history_obs_state.configuration_history_obs import HistoryObsConfig, HistoryLSTMConfig, HistoryConv1dConfig
 from lerobot.policies.customACT.key_history_state.configuration_key_history import KeyHistoryTokenConfig
-from lerobot.policies.customACT.history_token_replan_score.configuration_history_token_replan_score import (
+from lerobot.policies.customACT.replan_score_adaptive_chunking.configuration_history_token_replan_score import (
     HistoryTokenReplanScoreConfig,
 )
-from lerobot.policies.customACT.model_adaptive_chunk.configuration_model_adaptive_chunk import (
+from lerobot.policies.customACT.replan_score_adaptive_chunking.configuration_adaptive_chunking import (
     HistoryTokenAdaptiveChunkingConfig,
 )
 from lerobot.policies.customACT.segment_understanding.configuration_segment_understanding import SegmentUnderstandingConfig

@@ -1,4 +1,16 @@
-from lerobot.policies.customACT.replan_score_adaptive_chunking.modeling_history_token_replan_score import (
+from .configuration_adaptive_chunking import (
+    HistoryTokenAdaptiveChunkingConfig,
+    ReplanScoreAdaptiveChunkingConfig,
+)
+from .configuration_history_token_replan_score import (
+    HistoryTokenReplanScoreConfig,
+    RecoveryAdaptiveChunkingConfig,
+)
+from .modeling_adaptive_chunking import (
+    ReplanScoreAdaptiveChunkingController,
+    ReplanScoreAdaptiveChunkingDecision,
+)
+from .modeling_history_token_replan_score import (
     AdaptiveActionChunkingDecision,
     CausalConv1d,
     HistoryTokenReplanScoreModel,
@@ -18,9 +30,15 @@ __all__ = [
     "AdaptiveActionChunkingController",
     "AdaptiveActionChunkingDecision",
     "CausalConv1d",
+    "HistoryTokenAdaptiveChunkingConfig",
+    "HistoryTokenReplanScoreConfig",
     "HistoryTokenReplanScoreModel",
+    "RecoveryAdaptiveChunkingConfig",
     "RecoveryAdaptiveChunkingController",
     "RecoveryAdaptiveChunkingModel",
+    "ReplanScoreAdaptiveChunkingConfig",
+    "ReplanScoreAdaptiveChunkingController",
+    "ReplanScoreAdaptiveChunkingDecision",
     "ThreeRegimeAdaptiveChunkingController",
     "ThreeRegimeAdaptiveChunkingDecision",
     "compute_recovery_score_loss",

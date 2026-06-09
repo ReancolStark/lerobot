@@ -1,4 +1,4 @@
-from lerobot.policies.customACT.recovery_adaptive_chunking.modeling_recovery_adaptive_chunking import (
+from lerobot.policies.customACT.replan_score_adaptive_chunking.modeling_history_token_replan_score import (
     CausalConv1d,
     HistoryTokenReplanScoreModel,
     ThreeRegimeAdaptiveChunkingController,

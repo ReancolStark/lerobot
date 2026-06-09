@@ -51,13 +51,13 @@ from lerobot.utils.constants import (
 )
 #新增：自己的import
 from lerobot.policies.customACT.history_obs_state.modeling_history_obs import HistoryObsStateEmbedding
-from lerobot.policies.customACT.history_token_replan_score import (
+from lerobot.policies.customACT.replan_score_adaptive_chunking import (
     HistoryTokenReplanScoreModel,
+    ReplanScoreAdaptiveChunkingController,
     ThreeRegimeAdaptiveChunkingController,
     compute_replan_score_loss,
 )
 from lerobot.policies.customACT.key_history_state.modeling_key_history import KeyHistoryTokenEncoder
-from lerobot.policies.customACT.model_adaptive_chunk import ReplanScoreAdaptiveChunkingController
 from lerobot.policies.dino_act.backbone_res import ResNet18Backbone, get_custom_backbone
 from lerobot.policies.dino_act.convnext import ConvNeXtBackbone
 from lerobot.policies.dino_act.convnext_frame import ConvNeXtBackbone1

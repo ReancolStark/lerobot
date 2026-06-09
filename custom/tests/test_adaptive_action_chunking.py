@@ -18,26 +18,26 @@ def _load_adaptive_action_chunking_classes():
         / "lerobot"
         / "policies"
         / "customACT"
-        / "recovery_adaptive_chunking"
+        / "replan_score_adaptive_chunking"
     )
 
     for name in [
         "lerobot",
         "lerobot.policies",
         "lerobot.policies.customACT",
-        "lerobot.policies.customACT.recovery_adaptive_chunking",
+        "lerobot.policies.customACT.replan_score_adaptive_chunking",
     ]:
         package = types.ModuleType(name)
         package.__path__ = []
         sys.modules[name] = package
 
     config_name = (
-        "lerobot.policies.customACT.recovery_adaptive_chunking."
-        "configuration_recovery_adaptive_chunking"
+        "lerobot.policies.customACT.replan_score_adaptive_chunking."
+        "configuration_history_token_replan_score"
     )
     config_spec = importlib.util.spec_from_file_location(
         config_name,
-        module_dir / "configuration_recovery_adaptive_chunking.py",
+        module_dir / "configuration_history_token_replan_score.py",
     )
     config_module = importlib.util.module_from_spec(config_spec)
     assert config_spec is not None and config_spec.loader is not None
@@ -45,12 +45,12 @@ def _load_adaptive_action_chunking_classes():
     config_spec.loader.exec_module(config_module)
 
     modeling_name = (
-        "lerobot.policies.customACT.recovery_adaptive_chunking."
-        "modeling_recovery_adaptive_chunking"
+        "lerobot.policies.customACT.replan_score_adaptive_chunking."
+        "modeling_history_token_replan_score"
     )
     modeling_spec = importlib.util.spec_from_file_location(
         modeling_name,
-        module_dir / "modeling_recovery_adaptive_chunking.py",
+        module_dir / "modeling_history_token_replan_score.py",
     )
     modeling_module = importlib.util.module_from_spec(modeling_spec)
     assert modeling_spec is not None and modeling_spec.loader is not None
