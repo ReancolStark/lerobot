@@ -57,19 +57,9 @@ from lerobot.policies.customACT.replan_score_adaptive_chunking import (
     ThreeRegimeAdaptiveChunkingController,
     compute_replan_score_loss,
 )
-from lerobot.policies.customACT.key_history_state.modeling_key_history import KeyHistoryTokenEncoder
 from lerobot.policies.dino_act.backbone_res import ResNet18Backbone, get_custom_backbone
 from lerobot.policies.dino_act.convnext import ConvNeXtBackbone
 from lerobot.policies.dino_act.convnext_frame import ConvNeXtBackbone1
-from lerobot.policies.customACT.segment_understanding.modeling_segment_understanding import SegmentUnderstandingEmbedding
-from lerobot.policies.customACT.segment_understanding.utils.kinematics import SimpleKinematics
-from lerobot.policies.customACT.segment_understanding.utils.yolo_data_processer import YoloDataProcessor
-# from lerobot.policies.customACT.segment_understanding.utils.denormalize import denormalize_img_with_mean_stats,denormalize_obs_and_angle_to_rad
-# 由于想要未经初始化的数据，需要用到这个
-from lerobot.processor import PolicyProcessorPipeline
-from typing import Any
-from lerobot.processor.normalize_processor import NormalizerProcessorStep
-from lerobot.configs.types import FeatureType
 
 class ACTPolicy(PreTrainedPolicy):
     """
@@ -221,8 +211,6 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.use_history_token_replan_score:
             self._history_state_buffer = deque([], maxlen=self.config.history_len)
             self._history_action_buffer = deque([], maxlen=self.config.history_len)
-        if self.config.use_key_history_token:
-            self._key_history_state_buffer = deque([], maxlen=self.config.key_history_len)
 
     def _record_history_token_state(self, batch: dict[str, Tensor]) -> None:
         """Record the current normalized proprioceptive state for online inference.
@@ -239,16 +227,6 @@ class ACTPolicy(PreTrainedPolicy):
             state = state.unsqueeze(0)
         assert state.shape[0] == 1, "Online history-token buffer currently supports batch size 1."
         self._history_state_buffer.append(state[0])
-
-    def _record_key_history_state(self, batch: dict[str, Tensor]) -> None:
-        """Record current normalized state for online key-history inference."""
-        if not self.config.use_key_history_token or OBS_STATE_HISTORY in batch:
-            return
-        state = batch[OBS_STATE].detach()
-        if state.ndim == 1:
-            state = state.unsqueeze(0)
-        assert state.shape[0] == 1, "Online key history buffer currently supports batch size 1."
-        self._key_history_state_buffer.append(state[0])
 
     def _record_history_token_action(self, action: Tensor) -> None:
         """Record the normalized action selected at this control step.
@@ -338,39 +316,6 @@ class ACTPolicy(PreTrainedPolicy):
         batch[HISTORY_MASK] = (state_mask & action_mask).unsqueeze(0)
         return batch
 
-    def _add_key_history_to_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        """Attach key-history state fields to an online inference batch.
-
-        Training batches get observation.state.history from dataset delta timestamps.
-        In deployment, this method builds:
-          - observation.state.history: [1, H, state_dim]
-          - history_mask: [1, H]
-        """
-        if not self.config.use_key_history_token or OBS_STATE_HISTORY in batch:
-            return batch
-        if len(self._key_history_state_buffer) == 0:
-            self._record_key_history_state(batch)
-
-        batch = dict(batch)
-        current_state = batch[OBS_STATE]
-        if current_state.ndim == 1:
-            current_state = current_state.unsqueeze(0)
-        assert current_state.shape[0] == 1, "Online key history buffer currently supports batch size 1."
-
-        state_pad_value = self._key_history_state_buffer[0].view(1, -1).to(current_state.device)
-        state_values = [
-            v.to(current_state.device, dtype=current_state.dtype) for v in self._key_history_state_buffer
-        ]
-        state_history, state_mask = self._left_pad_history(
-            state_values,
-            target_len=self.config.key_history_len,
-            pad_value=state_pad_value,
-        )
-
-        batch[OBS_STATE_HISTORY] = state_history.unsqueeze(0)
-        batch[HISTORY_MASK] = state_mask.unsqueeze(0)
-        return batch
-
     def _observe_adaptive_action_chunking_state(self, batch: dict[str, Tensor]) -> None:
         if self.three_regime_adaptive_chunker is None:
             return
@@ -379,7 +324,6 @@ class ACTPolicy(PreTrainedPolicy):
     def prepare_online_inference_step(self, batch: dict[str, Tensor]) -> None:
         """Update online history buffers before a policy inference call."""
         self._record_history_token_state(batch)
-        self._record_key_history_state(batch)
         self._observe_adaptive_action_chunking_state(batch)
 
     def _get_replan_score_for_adaptive_action_chunking(self) -> float | None:
@@ -536,7 +480,6 @@ class ACTPolicy(PreTrainedPolicy):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
         batch = self._add_history_token_inputs_to_batch(batch)
-        batch = self._add_key_history_to_batch(batch)
 
         actions = self.model(batch)[0]
         return actions
@@ -650,50 +593,7 @@ class ACTPolicy(PreTrainedPolicy):
                     replan_target_info["future_action_correction"].mean().item()
                 )
 
-        key_history_aux_outputs = getattr(self.model, "key_history_aux_outputs", None)
-        if self.config.use_key_history_token and key_history_aux_outputs is not None:
-            first_action_mask = (~batch["action_is_pad"][:, 0]).unsqueeze(-1).to(dtype=batch[ACTION].dtype)
-
-            if self.config.key_history_action_loss_weight > 0:
-                key_hist_action_loss = (
-                    F.mse_loss(
-                        key_history_aux_outputs["hist_action_pred"],
-                        batch[ACTION][:, 0],
-                        reduction="none",
-                    )
-                    * first_action_mask
-                ).mean()
-                loss = loss + self.config.key_history_action_loss_weight * key_hist_action_loss
-                loss_dict["key_history_action_loss"] = key_hist_action_loss.item()
-
-            if self.config.key_history_event_loss_weight > 0:
-                history_mask = batch[HISTORY_MASK].to(dtype=torch.bool)
-                valid = history_mask.to(dtype=batch[ACTION].dtype)
-                event_prior = key_history_aux_outputs["event_prior"]
-                event_scores = key_history_aux_outputs["event_scores"]
-                denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
-                prior_mean = (event_prior * valid).sum(dim=1, keepdim=True) / denom
-                prior_var = (((event_prior - prior_mean) * valid) ** 2).sum(dim=1, keepdim=True) / denom
-                normalized_prior = (event_prior - prior_mean) / (prior_var.sqrt() + 1e-6)
-                key_event_prior_loss = (
-                    (torch.sigmoid(event_scores) - torch.sigmoid(normalized_prior)).pow(2) * valid
-                ).sum() / valid.sum().clamp_min(1.0)
-                loss = loss + self.config.key_history_event_loss_weight * key_event_prior_loss
-                loss_dict["key_history_event_prior_loss"] = key_event_prior_loss.item()
-
-            history_mask = batch[HISTORY_MASK].to(dtype=torch.bool)
-            event_scores = key_history_aux_outputs["event_scores"]
-            if history_mask.any():
-                loss_dict["key_history_event_score_mean"] = event_scores[history_mask].mean().item()
-            else:
-                loss_dict["key_history_event_score_mean"] = 0.0
-
         return loss, loss_dict
-
-    # 专门给yolo和fk用的预处理器设置函数，它们需要没有经过归一化的数据，然而lerobot传入的batch已经经过归一化了
-    def set_preprocessor(self, preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,):
-        self.model.preprocessor = preprocessor
-        
 
 class ACTTemporalEnsembler:
     def __init__(self, temporal_ensemble_coeff: float, chunk_size: int) -> None:
@@ -825,9 +725,6 @@ class ACT(nn.Module):
                                 │    state emb.         │
                                 └───────────────────────┘
     """
-    
-    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] = None
-
     def __init__(self, config: ACTConfig):
         # BERT style VAE encoder with input tokens [cls, robot_state, *action_sequence].
         # The cls token forms parameters of the latent's distribution (like this [*means, *log_variances]).
@@ -946,45 +843,6 @@ class ACT(nn.Module):
             )
             self.replan_aux_outputs = None
 
-        if self.config.use_key_history_token:
-            self.key_history_encoder = KeyHistoryTokenEncoder(
-                state_dim=self.config.robot_state_feature.shape[0],
-                action_dim=self.config.action_feature.shape[0],
-                dim_model=config.dim_model,
-                history_len=config.key_history_len,
-                num_segments=config.key_history_num_segments,
-                hidden_dim=config.key_history_hidden_dim,
-                conv_kernel_size=config.key_history_conv_kernel_size,
-                conv_dilations=config.key_history_conv_dilations,
-                dropout=config.key_history_dropout,
-                prior_scale_init=config.key_history_prior_scale_init,
-                selection_temperature=config.key_history_selection_temperature,
-            )
-            self.key_history_token_pos_embed = nn.Parameter(
-                torch.zeros(config.key_history_num_segments, config.dim_model)
-            )
-            self.key_history_aux_outputs = None
-        
-
-
-
-
-
-
-
-        # 新增：实例分割理解模块
-        if self.config.use_segment_understanding:
-            # 初始化两个必需的插件：FK & YOLO
-            self.kinematics = SimpleKinematics(config.seg_config.urdf_path, config.seg_config.ee_frame_name)
-            self.yolo_data_processer = YoloDataProcessor(config.seg_config, config.device)
-            # 动态赋值config
-            yolo_nc = self.yolo_data_processer.yolo.nc
-            config.seg_config.num_classes = yolo_nc
-            config.seg_config.output_dim = config.dim_model
-             # 初始化模块
-            self.segment_understanding_embedding = SegmentUnderstandingEmbedding(config.seg_config)
-
-
 
 
 
@@ -1017,10 +875,6 @@ class ACT(nn.Module):
 
         if self.config.n_history_obs_states > 0:# 历史动作token
             n_1d_tokens += self.config.ho_history_segment_num
-
-        if self.config.use_segment_understanding:# 实例分割理解 token
-            n_1d_tokens += 1
-
 
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
         if self.config.image_features:
@@ -1076,8 +930,6 @@ class ACT(nn.Module):
 
         if self.config.use_history_token_replan_score:
             self.replan_aux_outputs = None
-        if self.config.use_key_history_token:
-            self.key_history_aux_outputs = None
 
         if self.config.use_vae and self.training:
             assert ACTION in batch, (
@@ -1163,22 +1015,6 @@ class ACT(nn.Module):
 
 
 
-        # 新增：调用实例分割理解模块
-        if self.config.use_segment_understanding:
-            cam_key = f"observation.images.{self.config.seg_config.camera_name}"
-
-            # 反归一化到 [0, 1] 范围，因为act的数据经过了mean-std归一化，不符合YOLO与FK输入需求
-            norm_step:NormalizerProcessorStep = self.preprocessor.steps[3]
-            imgs_for_yolo = norm_step._apply_transform(batch[cam_key], cam_key, FeatureType.VISUAL, inverse=True)
-            obs_state_rad = norm_step._apply_transform(batch[OBS_STATE], OBS_STATE, FeatureType.STATE, inverse=True) * (torch.pi / 180.0) # 1、反归一化 2、度转弧度
-            
-            # 传入YOLO和FK，并得到分割理解的embedding
-            yolo_r, yolo_mask = self.yolo_data_processer.get_yolo_data(imgs_for_yolo)
-            ee_pose = self.kinematics.forward_kinematics_batch(obs_state_rad)
-            segment_understanding_embed = self.segment_understanding_embedding(yolo_r, yolo_mask , ee_pose) #(B, D)
-            # 最后把embedding放入tokens
-            encoder_in_tokens.append(segment_understanding_embed)
-
         if self.config.use_history_token_replan_score:
             missing = [key for key in (OBS_STATE_HISTORY, ACTION_HISTORY, HISTORY_MASK) if key not in batch]
             if missing:
@@ -1192,19 +1028,6 @@ class ACT(nn.Module):
             history_tokens = history_tokens.permute(1, 0, 2)  # [history_num_segments, B, D]
             encoder_in_tokens.extend(list(history_tokens))
             encoder_in_pos_embed.extend(list(self.history_token_replan_score_model.token_pos_embed.unsqueeze(1)))
-
-        if self.config.use_key_history_token:
-            missing = [key for key in (OBS_STATE_HISTORY, HISTORY_MASK) if key not in batch]
-            if missing:
-                raise KeyError(f"Missing key history batch keys: {missing}")
-            key_history_tokens, self.key_history_aux_outputs = self.key_history_encoder(
-                state_history=batch[OBS_STATE_HISTORY],
-                current_state=batch[OBS_STATE],
-                history_mask=batch[HISTORY_MASK],
-            )
-            key_history_tokens = key_history_tokens.permute(1, 0, 2)
-            encoder_in_tokens.extend(list(key_history_tokens))
-            encoder_in_pos_embed.extend(list(self.key_history_token_pos_embed.unsqueeze(1)))
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.

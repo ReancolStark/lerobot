@@ -19,14 +19,12 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.policies.customACT.history_obs_state.configuration_history_obs import HistoryObsConfig, HistoryLSTMConfig, HistoryConv1dConfig
-from lerobot.policies.customACT.key_history_state.configuration_key_history import KeyHistoryTokenConfig
 from lerobot.policies.customACT.replan_score_adaptive_chunking.configuration_history_token_replan_score import (
     HistoryTokenReplanScoreConfig,
 )
 from lerobot.policies.customACT.replan_score_adaptive_chunking.configuration_adaptive_chunking import (
     HistoryTokenAdaptiveChunkingConfig,
 )
-from lerobot.policies.customACT.segment_understanding.configuration_segment_understanding import SegmentUnderstandingConfig
 
 ThreeRegimeAdaptiveChunkingConfig = HistoryTokenReplanScoreConfig
 AdaptiveActionChunkingConfig = ThreeRegimeAdaptiveChunkingConfig
@@ -115,7 +113,7 @@ class ACTConfig(PreTrainedConfig):
 
     # Total switch for the proposed innovation: history tokens produce a replan
     # score, then adaptive chunking decides how many predicted actions to execute.
-    use_history_token_adaptive_chunking: bool = False
+    use_history_token_adaptive_chunking: bool = True
 
     # 是否开启计算状态平滑度指标（state smoothness），用于评估动作块内状态变化的平滑程度。这个指标可以帮助分析自适应动作块的效果，尤其是在运动突变发生时状态的变化情况。
     compute_state_smoothness: bool = True
@@ -187,35 +185,6 @@ class ACTConfig(PreTrainedConfig):
     history_token_pos_embed: str = "learned"
     # Legacy alias kept so old config files can still be loaded.
     recovery_token_pos_embed: str = "learned"
-
-
-
-# —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-    # 关键帧历史状态 Token 模块（No-failure Key History Token Module）。
-    # Event-guided key historical state token module.
-    # This no-failure history module only uses observation.state.history and history_mask.
-    # It does not use action.history, execution error, failure labels, or recovery scores.
-    use_key_history_token: bool = False
-    key_history_len: int = 64
-    key_history_num_segments: int = 4
-    key_history_hidden_dim: int = 256
-    key_history_conv_kernel_size: int = 3
-    key_history_conv_dilations: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
-    key_history_dropout: float = 0.1
-    key_history_prior_scale_init: float = 0.5
-    key_history_selection_temperature: float = 1.0
-    key_history_action_loss_weight: float = 0.05
-    key_history_event_loss_weight: float = 0.01
-    key_history_token_pos_embed: str = "learned"
-    # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
-
-
-
-    # Segment understanding config
-    use_segment_understanding: bool = False
-    seg_config: SegmentUnderstandingConfig = field(default_factory=SegmentUnderstandingConfig)
-
-
 
 # —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
     # 自适应动作块配置（Adaptive Action Chunking Config）。
@@ -334,11 +303,6 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
-        if self.use_history_token_replan_score and self.use_key_history_token:
-            raise ValueError(
-                "`use_history_token_replan_score` and `use_key_history_token` cannot both be enabled. "
-                "Disable history-token replan scoring when running the no-failure key-history experiment."
-            )
         if self.use_history_token_replan_score:
             if self.history_len <= 0:
                 raise ValueError("`history_len` must be positive when history-token replan scoring is enabled.")
@@ -354,23 +318,6 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError("`history_conv_dilations` cannot be empty.")
             if self.history_token_pos_embed != "learned":
                 raise ValueError("Only `history_token_pos_embed='learned'` is currently supported.")
-        if self.use_key_history_token:
-            if self.key_history_len <= 0:
-                raise ValueError("`key_history_len` must be positive when key history token is enabled.")
-            if self.key_history_num_segments <= 0:
-                raise ValueError("`key_history_num_segments` must be positive.")
-            if self.key_history_len < self.key_history_num_segments:
-                raise ValueError("`key_history_len` must be >= `key_history_num_segments`.")
-            if self.key_history_hidden_dim <= 0:
-                raise ValueError("`key_history_hidden_dim` must be positive.")
-            if self.key_history_conv_kernel_size <= 0:
-                raise ValueError("`key_history_conv_kernel_size` must be positive.")
-            if not self.key_history_conv_dilations:
-                raise ValueError("`key_history_conv_dilations` cannot be empty.")
-            if self.key_history_selection_temperature <= 0:
-                raise ValueError("`key_history_selection_temperature` must be positive.")
-            if self.key_history_token_pos_embed != "learned":
-                raise ValueError("Only `key_history_token_pos_embed='learned'` is currently supported.")
         if self.use_adaptive_action_chunking:
             aac = self.three_regime_adaptive_chunking
             if aac.state_history_len < 2:
@@ -459,22 +406,6 @@ class ACTConfig(PreTrainedConfig):
         else:
             raise ValueError(f"Unknown ho_type: {self.ho_type}")
 
-    def get_KeyHistoryTokenConfig(self) -> KeyHistoryTokenConfig:
-        return KeyHistoryTokenConfig(
-            enabled=self.use_key_history_token,
-            history_len=self.key_history_len,
-            num_segments=self.key_history_num_segments,
-            hidden_dim=self.key_history_hidden_dim,
-            conv_kernel_size=self.key_history_conv_kernel_size,
-            conv_dilations=self.key_history_conv_dilations,
-            dropout=self.key_history_dropout,
-            prior_scale_init=self.key_history_prior_scale_init,
-            selection_temperature=self.key_history_selection_temperature,
-            action_loss_weight=self.key_history_action_loss_weight,
-            event_loss_weight=self.key_history_event_loss_weight,
-            token_pos_embed=self.key_history_token_pos_embed,
-        )
-
     def get_history_token_replan_score_config(self) -> HistoryTokenReplanScoreConfig:
         return HistoryTokenReplanScoreConfig.from_legacy_config(self)
 
@@ -559,10 +490,6 @@ class ACTConfig(PreTrainedConfig):
     @property
     def recovery_action_history_delta_indices(self) -> list | None:
         return self.history_token_action_history_delta_indices
-
-    @property
-    def key_state_history_delta_indices(self) -> list | None:
-        return list(range(-self.key_history_len + 1, 1)) if self.use_key_history_token else None
 
     @property
     def reward_delta_indices(self) -> None:

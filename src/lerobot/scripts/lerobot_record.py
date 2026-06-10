@@ -140,11 +140,6 @@ from lerobot.utils.utils import (
     log_say,
 )
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
-from lerobot.policies.customACT.modeling_customACT import ACTPolicy as customACT
-from lerobot.policies.customACT.modeling_customACT import ACTConfig as customACTConfig
-
-
-
 @dataclass
 class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
@@ -767,10 +762,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     if policy is not None and isinstance(cfg.policy, CustomACTConfig) and cfg.policy.n_history_obs_states > 0:
         global obs_window
         obs_window = deque(maxlen=cfg.policy.n_history_obs_states)
-
-    # Segment-aware custom ACT needs access to the policy preprocessor.
-    if policy is not None and isinstance(policy, customACT) and isinstance(policy.config, customACTConfig) and policy.config.use_segment_understanding:
-        policy.set_preprocessor(preprocessor)
 
     robot.connect()
     if teleop is not None:

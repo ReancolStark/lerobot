@@ -155,22 +155,6 @@ def teleop_loop(
         # Process action for robot through pipeline
         robot_action_to_send = robot_action_processor((teleop_action, obs))
 
-        #DEBUG 在控制时显示末端位姿
-        # from lerobot.policies.customACT.segment_understanding.utils.kinematics import SimpleKinematics
-        # def clear_lines(n):
-        #     """清除上方 n 行"""
-        #     cursor_up = '\033[F'  # 移动光标到上一行开头
-        #     clear_line = '\033[K' # 清除当前行
-        #     print((cursor_up + clear_line) * n, end='', flush=True)  
-        # urdf_path = "custom/config/SO101/so101_new_calib.urdf"
-        # ee_frame_name = "gripper_frame_link"
-        # joint_names = list(robot.bus.motors.keys())
-        # kin = SimpleKinematics(urdf_path, ee_frame_name)
-        # ee_pose = kin.forward_kinematics_telop(robot_action_to_send, joint_names)
-        # result = ee_pose
-        # clear_lines(8)
-        # print(result)
-
         # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
         _sent_action = robot.send_action(robot_action_to_send)
         smoothness = smoothness_tracker.update(

@@ -10,11 +10,13 @@ class HistoryTokenAdaptiveChunkingConfig:
     This is inference-only. It does not change the ACT action head or the fixed
     predicted chunk size.
 
+    
+    
     Modes:
         replan_score: map the learned replan score continuously to chunk length.
         three_regime: use the previous stable/nominal/unstable controller.
     """
-
+    #可选mode：replane_score（连续映射）和three_regime（离散三段式）
     mode: str = "replan_score"
     min_chunk_size: int = 8
     max_chunk_size: int = 0  # 0 means use the ACT runtime chunk upper bound.

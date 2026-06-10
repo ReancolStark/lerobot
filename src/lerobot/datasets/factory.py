@@ -79,10 +79,6 @@ def resolve_delta_timestamps(
                 delta_timestamps[OBS_STATE_HISTORY] = [
                     i / ds_meta.fps for i in customact_cfg.recovery_state_history_delta_indices
                 ]
-            if key == OBS_STATE and customact_cfg.key_state_history_delta_indices is not None:
-                delta_timestamps[OBS_STATE_HISTORY] = [
-                    i / ds_meta.fps for i in customact_cfg.key_state_history_delta_indices
-                ]
             if key == ACTION and customact_cfg.recovery_action_history_delta_indices is not None:
                 delta_timestamps[ACTION_HISTORY] = [
                     i / ds_meta.fps for i in customact_cfg.recovery_action_history_delta_indices
