@@ -35,7 +35,10 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.target_object_perceiver_ffn_dim == 1024
     assert config.target_object_perceiver_dropout == pytest.approx(0.0)
     assert config.mask_geometry_token_gate_init == pytest.approx(0.2)
-    assert config.target_background_contrastive_loss_weight == pytest.approx(0.02)
+    assert config.target_attention_alignment_loss_weight == pytest.approx(0.005)
+    assert config.target_attention_alignment_context_weight == pytest.approx(0.5)
+    assert config.target_attention_alignment_background_weight == pytest.approx(0.5)
+    assert config.target_background_contrastive_loss_weight == pytest.approx(0.0)
     assert config.target_background_contrastive_margin == pytest.approx(0.2)
 
 
@@ -106,6 +109,10 @@ def test_mask_guided_visual_adapter_target_tokens():
     assert adapter.latest_consistency["target_feature"].shape == (2, 8)
     assert adapter.latest_consistency["background_feature"].shape == (2, 8)
     assert adapter.latest_consistency["target_tokens"].shape == (3, 2, 8)
+    assert adapter.latest_consistency["target_attention_weights"].shape == (2, 3, 30)
+    assert adapter.latest_consistency["target_attention_target_mask"].shape == (2, 1, 5, 6)
+    assert adapter.latest_consistency["target_attention_context_mask"].shape == (2, 1, 5, 6)
+    assert adapter.latest_consistency["target_attention_background_mask"].shape == (2, 1, 5, 6)
     assert adapter.latest_debug["target_token_attention_delta_ratio"] >= 0.0
     assert adapter.latest_debug["object_perceiver_delta_ratio"] >= 0.0
     assert adapter.latest_debug["object_perceiver_layers"] == pytest.approx(2.0)
@@ -162,6 +169,12 @@ def test_mask_weight_config_rejects_invalid_v4_params():
         MaskWeightConfig(target_object_perceiver_ffn_dim=0)
     with pytest.raises(ValueError):
         MaskWeightConfig(target_object_perceiver_dropout=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_attention_alignment_loss_weight=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_attention_alignment_context_weight=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_attention_alignment_background_weight=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(mask_geometry_token_gate_init=-0.1)
     with pytest.raises(ValueError):
@@ -293,7 +306,10 @@ def test_target_token_attention_does_not_inject_empty_mask():
 def test_target_background_contrastive_loss_has_debug_metrics():
     policy = ACTPolicy.__new__(ACTPolicy)
     policy.training = True
-    policy.config = SimpleNamespace(use_mask_weight=True, mw_config=MaskWeightConfig())
+    policy.config = SimpleNamespace(
+        use_mask_weight=True,
+        mw_config=MaskWeightConfig(target_background_contrastive_loss_weight=0.02),
+    )
     reference = {
         "cam": {
             "target_tokens": torch.ones(2, 2, 4),
@@ -308,6 +324,40 @@ def test_target_background_contrastive_loss_has_debug_metrics():
     assert debug["mask_weight/target_token/contrastive_pairs"] == pytest.approx(1.0)
     assert debug["mask_weight/target_token/contrastive_loss"] == pytest.approx(0.0)
     assert debug["mask_weight/target_token/target_cosine"] > debug["mask_weight/target_token/background_cosine"]
+
+
+def test_target_attention_alignment_loss_has_debug_metrics():
+    policy = ACTPolicy.__new__(ACTPolicy)
+    policy.training = True
+    policy.config = SimpleNamespace(use_mask_weight=True, mw_config=MaskWeightConfig())
+    attention = torch.zeros(2, 2, 4, requires_grad=True)
+    attention.data[:, 0, 0] = 0.5
+    attention.data[:, 0, 1] = 0.2
+    attention.data[:, 0, 2] = 0.2
+    attention.data[:, 0, 3] = 0.1
+    attention.data[:, 1, 0] = 0.1
+    attention.data[:, 1, 1] = 0.6
+    attention.data[:, 1, 2] = 0.2
+    attention.data[:, 1, 3] = 0.1
+    reference = {
+        "cam": {
+            "target_attention_weights": attention,
+            "target_attention_target_mask": torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]]).repeat(2, 1, 1, 1),
+            "target_attention_context_mask": torch.tensor([[[[0.0, 1.0], [0.0, 0.0]]]]).repeat(2, 1, 1, 1),
+            "target_attention_background_mask": torch.tensor([[[[0.0, 0.0], [1.0, 1.0]]]]).repeat(2, 1, 1, 1),
+        }
+    }
+
+    loss, debug = policy._compute_mask_weight_target_attention_alignment(reference, record_debug=True)
+
+    assert loss is not None
+    assert debug["mask_weight/target_attention/alignment_pairs"] == pytest.approx(1.0)
+    assert debug["mask_weight/target_attention/alignment_weight"] == pytest.approx(0.005)
+    assert debug["mask_weight/target_attention/target_mass"] == pytest.approx(0.5)
+    assert debug["mask_weight/target_attention/context_mass"] == pytest.approx(0.6)
+    assert debug["mask_weight/target_attention/background_mass"] == pytest.approx(0.3)
+    loss.backward()
+    assert attention.grad is not None
 
 
 def test_mask_guided_background_augmentation_preserves_target_and_changes_background():

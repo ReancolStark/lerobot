@@ -26,6 +26,9 @@ class MaskWeightConfig:
     target_object_perceiver_ffn_dim: int = 1024
     target_object_perceiver_dropout: float = 0.0
     mask_geometry_token_gate_init: float = 0.2
+    target_attention_alignment_loss_weight: float = 0.005
+    target_attention_alignment_context_weight: float = 0.5
+    target_attention_alignment_background_weight: float = 0.5
 
     # YOLO mask post-processing.
     mask_blur_kernel_size: int = 7
@@ -60,7 +63,7 @@ class MaskWeightConfig:
     background_consistency_loss_weight: float = 0.1
     background_feature_consistency_loss_weight: float = 0.03
     background_token_consistency_loss_weight: float = 0.03
-    target_background_contrastive_loss_weight: float = 0.02
+    target_background_contrastive_loss_weight: float = 0.0
     target_background_contrastive_margin: float = 0.2
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05
@@ -94,6 +97,12 @@ class MaskWeightConfig:
             raise ValueError("target_object_perceiver_ffn_dim must be positive.")
         if not 0.0 <= self.target_object_perceiver_dropout <= 1.0:
             raise ValueError("target_object_perceiver_dropout must be in [0, 1].")
+        if self.target_attention_alignment_loss_weight < 0.0:
+            raise ValueError("target_attention_alignment_loss_weight must be non-negative.")
+        if self.target_attention_alignment_context_weight < 0.0:
+            raise ValueError("target_attention_alignment_context_weight must be non-negative.")
+        if self.target_attention_alignment_background_weight < 0.0:
+            raise ValueError("target_attention_alignment_background_weight must be non-negative.")
         if not 0.0 <= self.reliability_min_area <= 1.0:
             raise ValueError("reliability_min_area must be in [0, 1].")
         if not 0.0 <= self.reliability_max_area <= 1.0:

@@ -661,6 +661,10 @@ class MaskGuidedVisualAdapter(nn.Module):
         attn_bias = token_mask_tensor * float(self.config.target_token_mask_bias_scale)
         num_heads = int(self.config.target_token_attention_heads)
         attn_bias = attn_bias.repeat_interleave(num_heads, dim=0).to(dtype=features.dtype, device=features.device)
+        need_attention_weights = (
+            record_debug
+            or float(getattr(self.config, "target_attention_alignment_loss_weight", 0.0)) > 0.0
+        )
 
         refined_tokens = token_seed
         attn_weights = None
@@ -669,7 +673,7 @@ class MaskGuidedVisualAdapter(nn.Module):
                 refined_tokens,
                 visual_tokens,
                 attn_bias,
-                need_weights=record_debug,
+                need_weights=need_attention_weights,
             )
         attn_delta = refined_tokens - token_seed
         reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
@@ -720,6 +724,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self,
         guided_features: torch.Tensor,
         target_mask: torch.Tensor,
+        context_mask: torch.Tensor,
         background_mask: torch.Tensor,
         target_tokens: torch.Tensor | None,
     ) -> dict[str, torch.Tensor]:
@@ -729,6 +734,13 @@ class MaskGuidedVisualAdapter(nn.Module):
         }
         if target_tokens is not None:
             data["target_tokens"] = target_tokens
+        target_token_debug = self.latest_target_token_debug
+        attention_weights = target_token_debug.get("attention_weights")
+        if isinstance(attention_weights, torch.Tensor):
+            data["target_attention_weights"] = attention_weights
+            data["target_attention_target_mask"] = target_mask.detach()
+            data["target_attention_context_mask"] = context_mask.detach()
+            data["target_attention_background_mask"] = background_mask.detach()
         return data
 
     def _make_region_tokens(
@@ -850,6 +862,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self.latest_consistency = self._make_consistency_data(
             guided_features,
             target_mask,
+            context_mask,
             background_mask,
             target_tokens,
         )

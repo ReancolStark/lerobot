@@ -202,6 +202,12 @@ class ACTPolicy(PreTrainedPolicy):
         )
         if target_token_loss is not None:
             loss = loss + target_token_loss
+        target_attention_loss, target_attention_debug = self._compute_mask_weight_target_attention_alignment(
+            mask_weight_consistency_refs,
+            record_debug=record_mask_weight_debug,
+        )
+        if target_attention_loss is not None:
+            loss = loss + target_attention_loss
 
         if self._should_use_mask_weight_background_consistency():
             augmented = self._build_mask_weight_background_augmented_batch(batch, mask_weight_masks)
@@ -271,6 +277,8 @@ class ACTPolicy(PreTrainedPolicy):
             loss_dict.update(background_debug)
         if target_token_debug:
             loss_dict.update(target_token_debug)
+        if target_attention_debug:
+            loss_dict.update(target_attention_debug)
 
         if mask_weight_consistency_refs:
             self.model.latest_mask_weight_consistency = self._detach_mask_weight_consistency(
@@ -371,6 +379,106 @@ class ACTPolicy(PreTrainedPolicy):
             "mask_weight/target_token/target_cosine": float(torch.stack(target_cosines).mean().item()),
             "mask_weight/target_token/background_cosine": float(torch.stack(background_cosines).mean().item()),
         }
+        return weighted_loss, debug
+
+    def _compute_mask_weight_target_attention_alignment(
+        self,
+        consistency: dict[str, dict[str, Tensor]],
+        record_debug: bool,
+    ) -> tuple[Tensor | None, dict[str, float]]:
+        mw_config = self.config.mw_config
+        weight = float(getattr(mw_config, "target_attention_alignment_loss_weight", 0.0))
+        context_weight = float(getattr(mw_config, "target_attention_alignment_context_weight", 0.0))
+        background_weight = float(getattr(mw_config, "target_attention_alignment_background_weight", 0.0))
+        if (
+            not self.training
+            or not self.config.use_mask_weight
+            or weight <= 0.0
+            or not consistency
+        ):
+            return None, {}
+
+        losses = []
+        target_masses = []
+        context_masses = []
+        background_masses = []
+        for data in consistency.values():
+            if not isinstance(data, dict):
+                continue
+            attention_weights = data.get("target_attention_weights")
+            target_mask = data.get("target_attention_target_mask")
+            context_mask = data.get("target_attention_context_mask")
+            background_mask = data.get("target_attention_background_mask")
+            if (
+                not isinstance(attention_weights, Tensor)
+                or not isinstance(target_mask, Tensor)
+                or not isinstance(context_mask, Tensor)
+                or not isinstance(background_mask, Tensor)
+                or attention_weights.ndim != 3
+                or attention_weights.shape[1] < 1
+            ):
+                continue
+
+            target_flat = target_mask.detach().flatten(2).squeeze(1).to(
+                dtype=attention_weights.dtype,
+                device=attention_weights.device,
+            )
+            context_flat = context_mask.detach().flatten(2).squeeze(1).to(
+                dtype=attention_weights.dtype,
+                device=attention_weights.device,
+            )
+            background_flat = background_mask.detach().flatten(2).squeeze(1).to(
+                dtype=attention_weights.dtype,
+                device=attention_weights.device,
+            )
+            if (
+                attention_weights.shape[0] != target_flat.shape[0]
+                or attention_weights.shape[-1] != target_flat.shape[-1]
+            ):
+                continue
+
+            target_mass = (attention_weights[:, 0, :] * target_flat).sum(dim=-1)
+            loss_terms = [1.0 - target_mass]
+            target_masses.append(target_mass.detach().mean())
+
+            object_attention = attention_weights[:, : min(2, attention_weights.shape[1]), :]
+            background_mass = (object_attention * background_flat.unsqueeze(1)).sum(dim=-1).mean(dim=1)
+            if background_weight > 0.0:
+                loss_terms.append(background_weight * background_mass)
+            background_masses.append(background_mass.detach().mean())
+
+            if attention_weights.shape[1] > 1 and context_weight > 0.0:
+                context_mass = (attention_weights[:, 1, :] * context_flat).sum(dim=-1)
+                loss_terms.append(context_weight * (1.0 - context_mass))
+                context_masses.append(context_mass.detach().mean())
+
+            losses.append(torch.stack([term.mean() for term in loss_terms]).sum())
+
+        if not losses:
+            if record_debug:
+                return None, {
+                    "mask_weight/target_attention/alignment_weight": weight,
+                    "mask_weight/target_attention/alignment_pairs": 0.0,
+                }
+            return None, {}
+
+        alignment_loss = torch.stack(losses).mean()
+        weighted_loss = alignment_loss * weight
+        if not record_debug:
+            return weighted_loss, {}
+
+        debug = {
+            "mask_weight/target_attention/alignment_loss": float(alignment_loss.detach().item()),
+            "mask_weight/target_attention/alignment_weight": weight,
+            "mask_weight/target_attention/alignment_weighted_loss": float(weighted_loss.detach().item()),
+            "mask_weight/target_attention/alignment_pairs": float(len(losses)),
+            "mask_weight/target_attention/target_mass": float(torch.stack(target_masses).mean().item()),
+            "mask_weight/target_attention/background_mass": float(torch.stack(background_masses).mean().item()),
+        }
+        if context_masses:
+            debug["mask_weight/target_attention/context_mass"] = float(torch.stack(context_masses).mean().item())
+            debug["mask_weight/target_attention/context_weight"] = context_weight
+        debug["mask_weight/target_attention/background_weight"] = background_weight
         return weighted_loss, debug
 
     def _should_use_mask_weight_background_consistency(self) -> bool:
