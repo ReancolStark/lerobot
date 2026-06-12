@@ -8,7 +8,30 @@ from lerobot.policies.customACT.mask_weight.configuration_mask_weight import Mas
 from lerobot.policies.customACT.mask_weight.mask_weight import (
     MaskGuidedVisualAdapter,
     make_mask_guided_background_augmentation,
+    yolo_result_to_mask_weight_data,
 )
+
+
+class _FakeBoxes:
+    def __init__(self, conf, cls, xyxy):
+        self.conf = torch.tensor(conf, dtype=torch.float32)
+        self.cls = torch.tensor(cls, dtype=torch.float32)
+        self.xyxy = torch.tensor(xyxy, dtype=torch.float32)
+
+    def __len__(self):
+        return int(self.conf.numel())
+
+
+class _FakeMasks:
+    def __init__(self, data):
+        self.data = torch.as_tensor(data, dtype=torch.float32)
+
+
+class _FakeResult:
+    def __init__(self, boxes, masks=None, orig_shape=(4, 4)):
+        self.boxes = boxes
+        self.masks = masks
+        self.orig_shape = orig_shape
 
 
 def test_mask_weight_config_v4_direct_defaults():
@@ -40,6 +63,13 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.target_attention_alignment_background_weight == pytest.approx(0.5)
     assert config.target_background_contrastive_loss_weight == pytest.approx(0.0)
     assert config.target_background_contrastive_margin == pytest.approx(0.2)
+    assert config.mask_dropout_p == pytest.approx(0.0)
+    assert config.use_class_aware_mgoa is True
+    assert config.class_mask_gate_init == pytest.approx(0.05)
+    assert config.class_summary_gate_init == pytest.approx(0.1)
+    assert config.class_summary_hidden_dim == 128
+    assert config.class_score_reg_weight == pytest.approx(0.001)
+    assert config.num_yolo_classes is None
 
 
 def test_mask_guided_visual_adapter_shapes_and_gradient():
@@ -178,6 +208,16 @@ def test_mask_weight_config_rejects_invalid_v4_params():
     with pytest.raises(ValueError):
         MaskWeightConfig(mask_geometry_token_gate_init=-0.1)
     with pytest.raises(ValueError):
+        MaskWeightConfig(class_mask_gate_init=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(class_summary_gate_init=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(class_summary_hidden_dim=0)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(class_score_reg_weight=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(num_yolo_classes=0)
+    with pytest.raises(ValueError):
         MaskWeightConfig(background_feature_consistency_loss_weight=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(background_token_consistency_loss_weight=-0.1)
@@ -185,6 +225,102 @@ def test_mask_weight_config_rejects_invalid_v4_params():
         MaskWeightConfig(target_background_contrastive_loss_weight=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(target_background_contrastive_margin=-0.1)
+
+
+def test_yolo_result_to_mask_weight_data_builds_per_class_masks_from_segments():
+    masks = torch.zeros(2, 4, 4)
+    masks[0, 0:2, 0:2] = 1.0
+    masks[1, 2:4, 2:4] = 1.0
+    result = _FakeResult(
+        boxes=_FakeBoxes(
+            conf=[0.5, 0.8],
+            cls=[0, 2],
+            xyxy=[[0, 0, 2, 2], [2, 2, 4, 4]],
+        ),
+        masks=_FakeMasks(masks),
+    )
+
+    data = yolo_result_to_mask_weight_data(result, num_classes=3, kernel_size=1)
+
+    assert data.mask.shape == (1, 1, 4, 4)
+    assert data.class_masks.shape == (1, 3, 4, 4)
+    assert data.class_area.shape == (1, 3)
+    assert data.class_confidence.shape == (1, 3)
+    assert data.mask[0, 0, 0, 0] == pytest.approx(0.5)
+    assert data.mask[0, 0, 3, 3] == pytest.approx(0.8)
+    assert data.class_masks[0, 0, 0, 0] == pytest.approx(0.5)
+    assert data.class_masks[0, 1].max() == pytest.approx(0.0)
+    assert data.class_masks[0, 2, 3, 3] == pytest.approx(0.8)
+    assert data.class_confidence[0, 0] == pytest.approx(0.5)
+    assert data.class_confidence[0, 2] == pytest.approx(0.8)
+
+
+def test_yolo_result_to_mask_weight_data_builds_per_class_masks_from_boxes():
+    result = _FakeResult(
+        boxes=_FakeBoxes(
+            conf=[0.4, 0.9],
+            cls=[1, 2],
+            xyxy=[[0, 0, 2, 2], [1, 1, 4, 4]],
+        ),
+        masks=None,
+    )
+
+    data = yolo_result_to_mask_weight_data(result, num_classes=3, kernel_size=1)
+
+    assert data.mask.shape == (1, 1, 4, 4)
+    assert data.class_masks.shape == (1, 3, 4, 4)
+    assert data.class_masks[0, 0].max() == pytest.approx(0.0)
+    assert data.class_masks[0, 1, 0, 0] == pytest.approx(0.4)
+    assert data.class_masks[0, 2, 3, 3] == pytest.approx(0.9)
+    assert data.class_confidence[0, 1] == pytest.approx(0.4)
+    assert data.class_confidence[0, 2] == pytest.approx(0.9)
+
+
+def test_class_aware_mgoa_adds_summary_to_target_tokens_and_receives_gradients():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        use_target_tokens=True,
+        num_yolo_classes=3,
+        class_summary_hidden_dim=6,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+
+    features = torch.randn(2, 8, 5, 6)
+    mask = torch.zeros(2, 1, 5, 6)
+    mask[:, :, 1:4, 2:5] = 1.0
+    class_masks = torch.zeros(2, 3, 5, 6)
+    class_masks[:, 1, 1:4, 2:5] = 1.0
+    class_area = class_masks.mean(dim=(2, 3))
+    class_confidence = class_masks.amax(dim=(2, 3))
+
+    guided_features, target_tokens, target_pos_embed, mask_geometry_token, mask_geometry_pos_embed = adapter(
+        features,
+        mask,
+        class_masks=class_masks,
+        class_area=class_area,
+        class_confidence=class_confidence,
+    )
+
+    assert guided_features.shape == features.shape
+    assert target_tokens.shape == (2, 2, 8)
+    assert target_pos_embed.shape == (2, 1, 8)
+    assert mask_geometry_token.shape == (1, 2, 8)
+    assert mask_geometry_pos_embed.shape == (1, 1, 8)
+    assert adapter.latest_debug["class/class_mask_delta_ratio"] >= 0.0
+    assert adapter.latest_debug["class/class_summary_gate"] == pytest.approx(0.1)
+    assert adapter.latest_debug["class/class_mask_gate"] == pytest.approx(0.05)
+    assert adapter.latest_debug["class/class_1_area"] > 0.0
+    assert adapter.latest_debug["class/class_1_confidence"] == pytest.approx(1.0)
+    assert adapter.latest_debug["class/class_1_summary_weight"] >= 0.0
+
+    (guided_features.mean() + target_tokens.mean()).backward()
+    assert adapter.class_mask_scale.grad is not None
+    assert adapter.class_summary_scale.grad is not None
+    assert adapter.class_embedding.weight.grad is not None
+    assert adapter.class_summary_value[-1].weight.grad is not None
 
 
 def test_target_token_attention_can_be_disabled_for_ablation():

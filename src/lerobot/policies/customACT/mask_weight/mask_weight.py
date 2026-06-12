@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import List, Union
 
 import torch
@@ -8,21 +9,30 @@ from torchvision.transforms import GaussianBlur
 from lerobot.policies.customACT.mask_weight.configuration_mask_weight import MaskWeightConfig
 
 
+@dataclass
+class MaskWeightYoloData:
+    mask: torch.Tensor
+    class_masks: torch.Tensor | None = None
+    class_area: torch.Tensor | None = None
+    class_confidence: torch.Tensor | None = None
+
+
 def _odd_kernel_size(kernel_size: int) -> int:
     kernel_size = max(1, int(kernel_size))
     return kernel_size if kernel_size % 2 == 1 else kernel_size + 1
 
 
-def yolo_result_to_soft_mask(
+def yolo_result_to_mask_weight_data(
     results: Union[List, object],
+    num_classes: int | None = None,
     kernel_size: int = 7,
     sigma: float = 2.0,
-) -> torch.Tensor:
-    """Convert Ultralytics YOLO results to a confidence-weighted soft mask.
+) -> MaskWeightYoloData:
+    """Convert Ultralytics YOLO results to union and per-class soft masks.
 
     Returns:
-        Tensor with shape [B, 1, H, W]. Instance masks are preferred; boxes are
-        used as a fallback when segmentation masks are unavailable.
+        MaskWeightYoloData. The union mask has shape [B, 1, H, W].
+        If num_classes is set, class_masks has shape [B, C, H, W].
     """
     if not isinstance(results, list):
         results = [results]
@@ -32,7 +42,11 @@ def yolo_result_to_soft_mask(
 
     height, width = results[0].orig_shape
     soft_masks = []
+    class_soft_masks = []
+    class_areas = []
+    class_confidences = []
     kernel_size = _odd_kernel_size(kernel_size)
+    num_classes = 0 if num_classes is None else max(0, int(num_classes))
 
     for result in results:
         if result.masks is not None:
@@ -43,24 +57,42 @@ def yolo_result_to_soft_mask(
             device = torch.device("cpu")
 
         hard_mask = torch.zeros((1, height, width), dtype=torch.float32, device=device)
+        class_mask = (
+            torch.zeros((num_classes, height, width), dtype=torch.float32, device=device)
+            if num_classes > 0
+            else None
+        )
+        class_conf = (
+            torch.zeros((num_classes,), dtype=torch.float32, device=device)
+            if num_classes > 0
+            else None
+        )
 
         if result.masks is not None and result.boxes is not None and len(result.masks.data) > 0:
             masks = result.masks.data.float()
             confs = result.boxes.conf.to(device=device, dtype=torch.float32)
+            classes = result.boxes.cls.to(device=device, dtype=torch.long)
 
-            for i in range(len(masks)):
+            for i in range(min(len(masks), len(confs))):
                 mask_i = F.interpolate(
                     masks[i].unsqueeze(0).unsqueeze(0),
                     size=(height, width),
                     mode="bilinear",
                     align_corners=False,
                 ).squeeze(0).squeeze(0)
-                hard_mask[0] = torch.maximum(hard_mask[0], mask_i * confs[i])
+                weighted_mask = mask_i * confs[i]
+                hard_mask[0] = torch.maximum(hard_mask[0], weighted_mask)
+                if class_mask is not None and i < len(classes):
+                    cls_id = int(classes[i].item())
+                    if 0 <= cls_id < num_classes:
+                        class_mask[cls_id] = torch.maximum(class_mask[cls_id], weighted_mask)
+                        class_conf[cls_id] = torch.maximum(class_conf[cls_id], confs[i])
 
         elif result.boxes is not None and len(result.boxes) > 0:
             boxes = result.boxes
             for i in range(len(boxes)):
                 conf = boxes.conf[i].to(device=device, dtype=torch.float32)
+                cls_id = int(boxes.cls[i].item()) if hasattr(boxes, "cls") else -1
                 x1, y1, x2, y2 = boxes.xyxy[i].detach().round().to(torch.int64).tolist()
 
                 x1 = max(0, min(width, x1))
@@ -69,6 +101,12 @@ def yolo_result_to_soft_mask(
                 y2 = max(0, min(height, y2))
                 if x2 > x1 and y2 > y1:
                     hard_mask[0, y1:y2, x1:x2] = torch.maximum(hard_mask[0, y1:y2, x1:x2], conf)
+                    if class_mask is not None and 0 <= cls_id < num_classes:
+                        class_mask[cls_id, y1:y2, x1:x2] = torch.maximum(
+                            class_mask[cls_id, y1:y2, x1:x2],
+                            conf,
+                        )
+                        class_conf[cls_id] = torch.maximum(class_conf[cls_id], conf)
 
         if hard_mask.max() > 0 and kernel_size > 1:
             blur = GaussianBlur(kernel_size=kernel_size, sigma=float(sigma))
@@ -76,10 +114,37 @@ def yolo_result_to_soft_mask(
             soft_mask = torch.clamp(soft_mask, 0.0, 1.0)
         else:
             soft_mask = hard_mask
+        if class_mask is not None:
+            if class_mask.max() > 0 and kernel_size > 1:
+                blur = GaussianBlur(kernel_size=kernel_size, sigma=float(sigma))
+                class_mask = blur(class_mask.unsqueeze(0)).squeeze(0)
+                class_mask = torch.clamp(class_mask, 0.0, 1.0)
+            class_soft_masks.append(class_mask)
+            class_areas.append(class_mask.mean(dim=(1, 2)))
+            class_confidences.append(class_conf)
 
         soft_masks.append(soft_mask)
 
-    return torch.stack(soft_masks, dim=0)
+    return MaskWeightYoloData(
+        mask=torch.stack(soft_masks, dim=0),
+        class_masks=torch.stack(class_soft_masks, dim=0) if class_soft_masks else None,
+        class_area=torch.stack(class_areas, dim=0) if class_areas else None,
+        class_confidence=torch.stack(class_confidences, dim=0) if class_confidences else None,
+    )
+
+
+def yolo_result_to_soft_mask(
+    results: Union[List, object],
+    kernel_size: int = 7,
+    sigma: float = 2.0,
+) -> torch.Tensor:
+    """Convert Ultralytics YOLO results to a confidence-weighted soft union mask."""
+    return yolo_result_to_mask_weight_data(
+        results,
+        num_classes=None,
+        kernel_size=kernel_size,
+        sigma=sigma,
+    ).mask
 
 
 def make_mask_guided_background_augmentation(
@@ -303,6 +368,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self.latest_consistency: dict[str, torch.Tensor] = {}
         self.latest_target_token_debug: dict[str, torch.Tensor | None] = {}
         self.latest_mask_geometry_debug: dict[str, torch.Tensor | None] = {}
+        self.latest_class_debug: dict[str, torch.Tensor | None] = {}
 
         hidden_dim = int(config.adapter_hidden_dim)
         if config.use_spatial_embedding:
@@ -315,6 +381,45 @@ class MaskGuidedVisualAdapter(nn.Module):
             nn.init.zeros_(self.mask_encoder[-1].bias)
         else:
             self.mask_encoder = None
+
+        self.num_yolo_classes = int(config.num_yolo_classes or 0)
+        self.use_class_aware_mgoa = bool(config.use_class_aware_mgoa and self.num_yolo_classes > 0)
+        if self.use_class_aware_mgoa:
+            class_hidden_dim = int(config.class_summary_hidden_dim)
+            self.class_mask_encoder = nn.Sequential(
+                nn.Conv2d(self.num_yolo_classes, hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, dim_model, kernel_size=1),
+            )
+            nn.init.zeros_(self.class_mask_encoder[-1].weight)
+            nn.init.zeros_(self.class_mask_encoder[-1].bias)
+            self.class_mask_scale = nn.Parameter(torch.tensor(float(config.class_mask_gate_init)))
+
+            self.class_embedding = nn.Embedding(self.num_yolo_classes, class_hidden_dim)
+            self.class_summary_value = nn.Sequential(
+                nn.LayerNorm(class_hidden_dim + 2),
+                nn.Linear(class_hidden_dim + 2, class_hidden_dim),
+                nn.GELU(),
+                nn.Linear(class_hidden_dim, dim_model),
+            )
+            nn.init.normal_(self.class_summary_value[-1].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.class_summary_value[-1].bias)
+            self.class_summary_score = nn.Sequential(
+                nn.LayerNorm(class_hidden_dim + 2),
+                nn.Linear(class_hidden_dim + 2, 1),
+            )
+            nn.init.zeros_(self.class_summary_score[-1].weight)
+            nn.init.zeros_(self.class_summary_score[-1].bias)
+            self.class_summary_bias = nn.Parameter(torch.zeros(self.num_yolo_classes))
+            self.class_summary_scale = nn.Parameter(torch.tensor(float(config.class_summary_gate_init)))
+        else:
+            self.class_mask_encoder = None
+            self.register_parameter("class_mask_scale", None)
+            self.class_embedding = None
+            self.class_summary_value = None
+            self.class_summary_score = None
+            self.register_parameter("class_summary_bias", None)
+            self.register_parameter("class_summary_scale", None)
 
         if config.use_residual_gate:
             self.feature_adapter = nn.Sequential(
@@ -515,6 +620,111 @@ class MaskGuidedVisualAdapter(nn.Module):
             reliability = torch.where(area > 0.0, reliability_with_floor, torch.zeros_like(reliability))
         return reliability, confidence_score, area
 
+    def _prepare_class_masks(
+        self,
+        class_masks: torch.Tensor | None,
+        features: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if (
+            not self.use_class_aware_mgoa
+            or not isinstance(class_masks, torch.Tensor)
+            or class_masks.ndim != 4
+            or class_masks.shape[1] != self.num_yolo_classes
+        ):
+            return None
+
+        class_masks = class_masks.to(dtype=features.dtype, device=features.device)
+        if class_masks.shape[-2:] != features.shape[-2:]:
+            class_masks = F.interpolate(
+                class_masks,
+                size=features.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        return torch.clamp(class_masks, 0.0, 1.0)
+
+    def _class_stats(
+        self,
+        class_masks: torch.Tensor | None,
+        class_area: torch.Tensor | None,
+        class_confidence: torch.Tensor | None,
+        features: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if class_masks is None:
+            return None, None
+
+        if isinstance(class_area, torch.Tensor) and class_area.shape == class_masks.shape[:2]:
+            area = class_area.to(dtype=features.dtype, device=features.device)
+        else:
+            area = class_masks.detach().mean(dim=(2, 3)).to(dtype=features.dtype, device=features.device)
+
+        if isinstance(class_confidence, torch.Tensor) and class_confidence.shape == class_masks.shape[:2]:
+            confidence = class_confidence.to(dtype=features.dtype, device=features.device)
+        else:
+            confidence = class_masks.detach().amax(dim=(2, 3)).to(dtype=features.dtype, device=features.device)
+
+        return torch.clamp(area, 0.0, 1.0), torch.clamp(confidence, 0.0, 1.0)
+
+    def class_score_regularization_loss(self) -> torch.Tensor | None:
+        weight = float(getattr(self.config, "class_score_reg_weight", 0.0))
+        if (
+            not self.use_class_aware_mgoa
+            or self.class_summary_bias is None
+            or weight <= 0.0
+        ):
+            return None
+        return self.class_summary_bias.pow(2).mean() * weight
+
+    def _make_class_summary(
+        self,
+        features: torch.Tensor,
+        class_masks: torch.Tensor | None,
+        class_area: torch.Tensor | None,
+        class_confidence: torch.Tensor | None,
+        reliability: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if (
+            not self.use_class_aware_mgoa
+            or self.class_embedding is None
+            or self.class_summary_value is None
+            or self.class_summary_score is None
+            or self.class_summary_scale is None
+            or self.class_summary_bias is None
+            or class_masks is None
+        ):
+            self.latest_class_debug = {}
+            return None
+
+        area, confidence = self._class_stats(class_masks, class_area, class_confidence, features)
+        if area is None or confidence is None:
+            self.latest_class_debug = {}
+            return None
+
+        batch_size = features.shape[0]
+        class_ids = torch.arange(self.num_yolo_classes, device=features.device)
+        class_embed = self.class_embedding(class_ids).unsqueeze(0).expand(batch_size, -1, -1)
+        class_input = torch.cat([class_embed, area.unsqueeze(-1), confidence.unsqueeze(-1)], dim=-1)
+        class_values = self.class_summary_value(class_input)
+        class_logits = self.class_summary_score(class_input).squeeze(-1) + self.class_summary_bias.view(1, -1)
+
+        present = (area > 0.0) | (confidence > 0.0)
+        has_class = present.any(dim=1, keepdim=True)
+        class_logits = class_logits.masked_fill(~present, -1e4)
+        weights = torch.softmax(class_logits, dim=1)
+        weights = torch.where(has_class, weights, torch.zeros_like(weights))
+
+        summary = (weights.unsqueeze(-1) * class_values).sum(dim=1)
+        reliability_gate = reliability.to(dtype=features.dtype, device=features.device).view(batch_size, 1)
+        summary = self.class_summary_scale * reliability_gate * summary
+
+        self.latest_class_debug = {
+            "area": area.detach(),
+            "confidence": confidence.detach(),
+            "summary_weights": weights.detach(),
+            "summary": summary,
+        }
+        return summary
+
     def _build_guidance(
         self,
         mask: torch.Tensor,
@@ -688,6 +898,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         context_mask: torch.Tensor,
         background_mask: torch.Tensor,
         reliability: torch.Tensor,
+        class_summary: torch.Tensor | None,
         record_debug: bool,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self.target_token_proj is None:
@@ -699,6 +910,8 @@ class MaskGuidedVisualAdapter(nn.Module):
         for pool_mask in token_masks:
             pooled_tokens.append(self._masked_pool(features, pool_mask))
         target_tokens = torch.stack(pooled_tokens, dim=0)
+        if class_summary is not None:
+            target_tokens = target_tokens + class_summary.unsqueeze(0)
         target_tokens = target_tokens + self.target_token_proj(target_tokens)
 
         target_tokens, attention_delta, attention_weights = self._apply_target_token_attention(
@@ -800,6 +1013,9 @@ class MaskGuidedVisualAdapter(nn.Module):
         self,
         visual_features: torch.Tensor,
         mask: torch.Tensor,
+        class_masks: torch.Tensor | None = None,
+        class_area: torch.Tensor | None = None,
+        class_confidence: torch.Tensor | None = None,
         record_debug: bool = True,
     ) -> tuple[
         torch.Tensor,
@@ -820,12 +1036,33 @@ class MaskGuidedVisualAdapter(nn.Module):
         ) = self._build_guidance(mask)
         guidance = torch.cat([target_mask, context_mask, background_mask, confidence_map], dim=1)
         reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
+        prepared_class_masks = self._prepare_class_masks(class_masks, visual_features)
 
         guided_features = visual_features
         spatial_delta = None
         if self.mask_encoder is not None:
             spatial_delta = reliability_gate * self.mask_encoder(guidance)
             guided_features = guided_features + spatial_delta
+
+        class_mask_delta = None
+        class_summary = self._make_class_summary(
+            visual_features,
+            prepared_class_masks,
+            class_area,
+            class_confidence,
+            reliability,
+        )
+        if (
+            self.class_mask_encoder is not None
+            and self.class_mask_scale is not None
+            and prepared_class_masks is not None
+        ):
+            class_mask_delta = (
+                self.class_mask_scale
+                * reliability_gate
+                * self.class_mask_encoder(prepared_class_masks)
+            )
+            guided_features = guided_features + class_mask_delta
 
         residual_delta = None
         if self.feature_adapter is not None:
@@ -850,6 +1087,7 @@ class MaskGuidedVisualAdapter(nn.Module):
             context_mask,
             background_mask,
             reliability,
+            class_summary,
             record_debug=record_debug,
         )
         mask_geometry_token, mask_geometry_pos_embed = self._make_mask_geometry_token(
@@ -911,6 +1149,11 @@ class MaskGuidedVisualAdapter(nn.Module):
                 if region_delta is None
                 else region_delta.detach().float().pow(2).mean().sqrt()
             )
+            class_mask_delta_rms = (
+                torch.zeros((), device=visual_features.device)
+                if class_mask_delta is None
+                else class_mask_delta.detach().float().pow(2).mean().sqrt()
+            )
             target_token_debug = self.latest_target_token_debug
             target_token_attention_delta = target_token_debug.get("attention_delta")
             target_token_attention_delta_rms = (
@@ -930,6 +1173,8 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "visual_rms": float(visual_rms.item()),
                 "spatial_delta_rms": float(spatial_delta_rms.item()),
                 "spatial_delta_ratio": float((spatial_delta_rms / visual_rms).item()),
+                "class/class_mask_delta_rms": float(class_mask_delta_rms.item()),
+                "class/class_mask_delta_ratio": float((class_mask_delta_rms / visual_rms).item()),
                 "residual_delta_rms": float(residual_delta_rms.item()),
                 "residual_delta_ratio": float((residual_delta_rms / visual_rms).item()),
                 "region_attention_delta_rms": float(region_delta_rms.item()),
@@ -963,6 +1208,37 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "reliability_max": float(reliability.detach().float().max().item()),
                 "mask_noise_applied_ratio": float(mask_noise_applied.detach().float().mean().item()),
             }
+            class_debug = self.latest_class_debug
+            class_summary_debug = class_debug.get("summary")
+            if isinstance(class_summary_debug, torch.Tensor):
+                self.latest_debug["class/class_summary_norm"] = float(
+                    class_summary_debug.detach().float().pow(2).mean().sqrt().item()
+                )
+            else:
+                self.latest_debug["class/class_summary_norm"] = 0.0
+            if self.class_summary_scale is not None:
+                self.latest_debug["class/class_summary_gate"] = float(
+                    self.class_summary_scale.detach().item()
+                )
+            if self.class_mask_scale is not None:
+                self.latest_debug["class/class_mask_gate"] = float(
+                    self.class_mask_scale.detach().item()
+                )
+            class_area_debug = class_debug.get("area")
+            class_conf_debug = class_debug.get("confidence")
+            class_weight_debug = class_debug.get("summary_weights")
+            if isinstance(class_area_debug, torch.Tensor):
+                class_area_mean = class_area_debug.detach().float().mean(dim=0)
+                for class_id, value in enumerate(class_area_mean.tolist()):
+                    self.latest_debug[f"class/class_{class_id}_area"] = float(value)
+            if isinstance(class_conf_debug, torch.Tensor):
+                class_conf_mean = class_conf_debug.detach().float().mean(dim=0)
+                for class_id, value in enumerate(class_conf_mean.tolist()):
+                    self.latest_debug[f"class/class_{class_id}_confidence"] = float(value)
+            if isinstance(class_weight_debug, torch.Tensor):
+                class_weight_mean = class_weight_debug.detach().float().mean(dim=0)
+                for class_id, value in enumerate(class_weight_mean.tolist()):
+                    self.latest_debug[f"class/class_{class_id}_summary_weight"] = float(value)
             if isinstance(mask_geometry_values, torch.Tensor):
                 geometry_float = mask_geometry_values.detach().float()
                 self.latest_debug["mask_geometry_center_x"] = float(geometry_float[:, 0].mean().item())

@@ -15,7 +15,7 @@ class MaskWeightConfig:
     adapter_hidden_dim: int = 128
     gate_init: float = 0.2
     context_dilation: int = 3
-    mask_dropout_p: float = 0.1
+    mask_dropout_p: float = 0.0
     num_target_tokens: int = 2
     use_target_token_attention: bool = True
     target_token_attention_heads: int = 4
@@ -29,6 +29,12 @@ class MaskWeightConfig:
     target_attention_alignment_loss_weight: float = 0.005
     target_attention_alignment_context_weight: float = 0.5
     target_attention_alignment_background_weight: float = 0.5
+    use_class_aware_mgoa: bool = True
+    class_mask_gate_init: float = 0.05
+    class_summary_gate_init: float = 0.1
+    class_summary_hidden_dim: int = 128
+    class_score_reg_weight: float = 0.001
+    num_yolo_classes: int | None = None
 
     # YOLO mask post-processing.
     mask_blur_kernel_size: int = 7
@@ -103,6 +109,16 @@ class MaskWeightConfig:
             raise ValueError("target_attention_alignment_context_weight must be non-negative.")
         if self.target_attention_alignment_background_weight < 0.0:
             raise ValueError("target_attention_alignment_background_weight must be non-negative.")
+        if self.class_mask_gate_init < 0.0:
+            raise ValueError("class_mask_gate_init must be non-negative.")
+        if self.class_summary_gate_init < 0.0:
+            raise ValueError("class_summary_gate_init must be non-negative.")
+        if self.class_summary_hidden_dim <= 0:
+            raise ValueError("class_summary_hidden_dim must be positive.")
+        if self.class_score_reg_weight < 0.0:
+            raise ValueError("class_score_reg_weight must be non-negative.")
+        if self.num_yolo_classes is not None and self.num_yolo_classes <= 0:
+            raise ValueError("num_yolo_classes must be positive when set.")
         if not 0.0 <= self.reliability_min_area <= 1.0:
             raise ValueError("reliability_min_area must be in [0, 1].")
         if not 0.0 <= self.reliability_max_area <= 1.0:
