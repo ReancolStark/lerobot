@@ -49,6 +49,7 @@ from lerobot.policies.customACT.mask_weight.mask_weight import (
     MaskGuidedVisualAdapter,
     make_mask_guided_background_augmentation,
     yolo_result_to_soft_mask,
+    yolo_results_to_instance_masks,
 )
 # from lerobot.policies.customACT.segment_understanding.utils.denormalize import denormalize_img_with_mean_stats,denormalize_obs_and_angle_to_rad
 # 由于想要未经初始化的数据，需要用到这个
@@ -59,6 +60,7 @@ from lerobot.configs.types import FeatureType
 
 _ACT_FORCED_LATENT_SAMPLE = "_act_forced_latent_sample"
 _MASK_WEIGHT_FORCED_MASKS = "_mask_weight_forced_masks"
+_MASK_WEIGHT_FORCED_INSTANCE_MASKS = "_mask_weight_forced_instance_masks"
 _MASK_WEIGHT_SKIP_DEBUG = "_mask_weight_skip_debug"
 
 class ACTPolicy(PreTrainedPolicy):
@@ -194,6 +196,7 @@ class ACTPolicy(PreTrainedPolicy):
             else {}
         )
         mask_weight_masks = dict(getattr(self.model, "latest_mask_weight_masks", None) or {})
+        mask_weight_instance_masks = dict(getattr(self.model, "latest_mask_weight_instance_masks", None) or {})
         mask_weight_consistency_refs = dict(getattr(self.model, "latest_mask_weight_consistency", None) or {})
         background_debug: dict[str, float | bool] = {}
         target_token_loss, target_token_debug = self._compute_mask_weight_target_token_contrastive(
@@ -204,7 +207,11 @@ class ACTPolicy(PreTrainedPolicy):
             loss = loss + target_token_loss
 
         if self._should_use_mask_weight_background_consistency():
-            augmented = self._build_mask_weight_background_augmented_batch(batch, mask_weight_masks)
+            augmented = self._build_mask_weight_background_augmented_batch(
+                batch,
+                mask_weight_masks,
+                mask_weight_instance_masks,
+            )
             if augmented is not None:
                 aug_batch, background_debug = augmented
                 latent_sample = getattr(self.model, "latest_latent_sample", None)
@@ -220,6 +227,7 @@ class ACTPolicy(PreTrainedPolicy):
                 # is only a training constraint.
                 self.model.latest_mask_weight_debug = dict(mask_weight_debug)
                 self.model.latest_mask_weight_masks = dict(mask_weight_masks)
+                self.model.latest_mask_weight_instance_masks = dict(mask_weight_instance_masks)
                 self.model.latest_mask_weight_consistency = self._detach_mask_weight_consistency(
                     mask_weight_consistency_refs
                 )
@@ -461,6 +469,7 @@ class ACTPolicy(PreTrainedPolicy):
         self,
         batch: dict[str, Tensor],
         masks: dict[str, Tensor],
+        instance_masks: dict[str, Tensor] | None = None,
     ) -> tuple[dict[str, Tensor], dict[str, float | bool]] | None:
         if not masks:
             return None
@@ -472,6 +481,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         aug_batch = dict(batch)
         forced_masks: dict[str, Tensor] = {}
+        forced_instance_masks: dict[str, Tensor] = {}
         debug: dict[str, float | bool] = {"mask_weight/bg_aug/enabled": True}
         metric_totals: dict[str, float] = {}
         num_cameras = 0
@@ -506,6 +516,8 @@ class ACTPolicy(PreTrainedPolicy):
                 inverse=False,
             )
             forced_masks[img_key] = mask.detach()
+            if isinstance(instance_masks, dict) and img_key in instance_masks:
+                forced_instance_masks[img_key] = instance_masks[img_key].detach()
 
             cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
             for name, tensor_value in camera_debug.items():
@@ -520,6 +532,7 @@ class ACTPolicy(PreTrainedPolicy):
         if self.config.image_features:
             aug_batch[OBS_IMAGES] = [aug_batch[key] for key in self.config.image_features]
         aug_batch[_MASK_WEIGHT_FORCED_MASKS] = forced_masks
+        aug_batch[_MASK_WEIGHT_FORCED_INSTANCE_MASKS] = forced_instance_masks
         aug_batch[_MASK_WEIGHT_SKIP_DEBUG] = True
 
         debug["mask_weight/bg_aug/cameras"] = float(num_cameras)
@@ -697,6 +710,7 @@ class ACT(nn.Module):
         self.debug_yolo_call_count = 0
         self.latest_mask_weight_debug: dict[str, float | str | bool] = {}
         self.latest_mask_weight_masks: dict[str, Tensor] = {}
+        self.latest_mask_weight_instance_masks: dict[str, Tensor] = {}
         self.latest_mask_weight_consistency: dict[str, dict[str, Tensor]] = {}
         self.latest_latent_sample: Tensor | None = None
 
@@ -929,6 +943,7 @@ class ACT(nn.Module):
             self.latest_yolo_debug_overlays = {}
         self.latest_mask_weight_debug = {}
         self.latest_mask_weight_masks = {}
+        self.latest_mask_weight_instance_masks = {}
         self.latest_mask_weight_consistency = {}
 
         # Prepare the latent for input to the transformer encoder.
@@ -1012,6 +1027,7 @@ class ACT(nn.Module):
         yolo_results_by_img_key = {}
         imgs_for_yolo_by_img_key = {}
         forced_mask_weight_masks = batch.get(_MASK_WEIGHT_FORCED_MASKS, None)
+        forced_mask_weight_instance_masks = batch.get(_MASK_WEIGHT_FORCED_INSTANCE_MASKS, None)
         skip_mask_weight_debug = bool(batch.get(_MASK_WEIGHT_SKIP_DEBUG, False)) or not bool(
             getattr(self.config.mw_config, "record_debug_log", True)
         )
@@ -1062,6 +1078,7 @@ class ACT(nn.Module):
                 cam_features = self.backbone(img)["feature_map"]    # [8, 3, 480, 640] -> [8, 512, 15, 20]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 yolo_mask = None
+                yolo_instance_masks = None
                 yolo_results = None
                 imgs_for_yolo = None
                 target_tokens = None
@@ -1075,8 +1092,15 @@ class ACT(nn.Module):
                         if isinstance(forced_mask_weight_masks, dict)
                         else None
                     )
+                    forced_yolo_instance_masks = (
+                        forced_mask_weight_instance_masks.get(img_key)
+                        if isinstance(forced_mask_weight_instance_masks, dict)
+                        else None
+                    )
                     if forced_yolo_mask is not None:
                         yolo_mask = forced_yolo_mask.to(device=img.device)
+                        if forced_yolo_instance_masks is not None:
+                            yolo_instance_masks = forced_yolo_instance_masks.to(device=img.device)
                     else:
                         if img_key in yolo_results_by_img_key:
                             imgs_for_yolo = imgs_for_yolo_by_img_key[img_key]
@@ -1099,7 +1123,20 @@ class ACT(nn.Module):
                             kernel_size=getattr(self.config.mw_config, "mask_blur_kernel_size", 7),
                             sigma=getattr(self.config.mw_config, "mask_blur_sigma", 2.0),
                         )
+                        if getattr(self.config.mw_config, "use_instance_object_tokens", True):
+                            yolo_instance_masks, _, _ = yolo_results_to_instance_masks(
+                                yolo_results,
+                                max_instances=getattr(
+                                    self.config.mw_config,
+                                    "max_instance_object_tokens",
+                                    4,
+                                ),
+                                kernel_size=getattr(self.config.mw_config, "mask_blur_kernel_size", 7),
+                                sigma=getattr(self.config.mw_config, "mask_blur_sigma", 2.0),
+                            )
                     self.latest_mask_weight_masks[img_key] = yolo_mask.detach()
+                    if yolo_instance_masks is not None:
+                        self.latest_mask_weight_instance_masks[img_key] = yolo_instance_masks.detach()
 
                     if not skip_mask_weight_debug:
                         cam_name = img_key.replace(f"{OBS_IMAGES}.", "")
@@ -1116,6 +1153,14 @@ class ACT(nn.Module):
                         self.latest_mask_weight_debug[f"mask_weight/{cam_name}/mask_coverage"] = float(
                             (mask_for_debug > 0.05).float().mean().item()
                         )
+                        if yolo_instance_masks is not None:
+                            instance_for_debug = yolo_instance_masks.detach()
+                            self.latest_mask_weight_debug[f"mask_weight/{cam_name}/instance_masks"] = float(
+                                instance_for_debug.shape[1]
+                            )
+                            self.latest_mask_weight_debug[f"mask_weight/{cam_name}/instance_mask_valid_count"] = float(
+                                (instance_for_debug.amax(dim=(2, 3, 4)) > 0.0).float().sum(dim=1).mean().item()
+                            )
 
                 # 投影features到指定维度
                 cam_features = self.encoder_img_feat_input_proj(cam_features)    # [8, 512, 15, 20] -> [8, 512, 15, 20]
@@ -1139,6 +1184,7 @@ class ACT(nn.Module):
                     ) = self.mask_guided_visual_adapter(
                         cam_features,
                         mask_resized,
+                        instance_masks=yolo_instance_masks,
                         record_debug=not skip_mask_weight_debug,
                     )
                     self.latest_mask_weight_consistency[img_key] = dict(

@@ -82,6 +82,131 @@ def yolo_result_to_soft_mask(
     return torch.stack(soft_masks, dim=0)
 
 
+def yolo_results_to_instance_masks(
+    results: Union[List, object],
+    max_instances: int,
+    kernel_size: int = 7,
+    sigma: float = 2.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert YOLO results into fixed-size per-instance soft masks.
+
+    Returns:
+        instance_masks: [B, N, 1, H, W], confidence-weighted soft masks.
+        confidences: [B, N, 1, 1, 1], YOLO confidence per retained instance.
+        valid: [B, N, 1, 1, 1], 1 for retained instances and 0 for padding.
+    """
+    if not isinstance(results, list):
+        results = [results]
+
+    if len(results) == 0:
+        raise ValueError("YOLO results must contain at least one result.")
+
+    max_instances = max(0, int(max_instances))
+    height, width = results[0].orig_shape
+    kernel_size = _odd_kernel_size(kernel_size)
+
+    first_result = results[0]
+    if first_result.masks is not None:
+        default_device = first_result.masks.data.device
+    elif first_result.boxes is not None:
+        default_device = first_result.boxes.conf.device
+    else:
+        default_device = torch.device("cpu")
+
+    if max_instances == 0:
+        empty_masks = torch.empty(
+            (len(results), 0, 1, height, width),
+            dtype=torch.float32,
+            device=default_device,
+        )
+        empty_stats = torch.empty(
+            (len(results), 0, 1, 1, 1),
+            dtype=torch.float32,
+            device=default_device,
+        )
+        return empty_masks, empty_stats, empty_stats.clone()
+
+    batched_masks = []
+    batched_confs = []
+    batched_valid = []
+
+    for result in results:
+        if result.masks is not None:
+            device = result.masks.data.device
+        elif result.boxes is not None:
+            device = result.boxes.conf.device
+        else:
+            device = default_device
+
+        instance_masks = torch.zeros(
+            (max_instances, 1, height, width),
+            dtype=torch.float32,
+            device=device,
+        )
+        confidences = torch.zeros(
+            (max_instances, 1, 1, 1),
+            dtype=torch.float32,
+            device=device,
+        )
+        valid = torch.zeros(
+            (max_instances, 1, 1, 1),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        candidates: list[tuple[float, torch.Tensor, torch.Tensor]] = []
+        num_masks = 0 if result.masks is None else len(result.masks.data)
+        num_boxes = 0 if result.boxes is None else len(result.boxes)
+        num_candidates = max(num_masks, num_boxes)
+
+        for i in range(num_candidates):
+            if result.boxes is not None and i < num_boxes:
+                conf = result.boxes.conf[i].to(device=device, dtype=torch.float32)
+            else:
+                conf = torch.ones((), dtype=torch.float32, device=device)
+
+            mask_i = torch.zeros((1, height, width), dtype=torch.float32, device=device)
+            if result.masks is not None and i < num_masks:
+                raw_mask = result.masks.data[i].to(device=device, dtype=torch.float32)
+                mask_i = F.interpolate(
+                    raw_mask.unsqueeze(0).unsqueeze(0),
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                mask_i = torch.clamp(mask_i * conf, 0.0, 1.0)
+            elif result.boxes is not None and i < num_boxes:
+                x1, y1, x2, y2 = result.boxes.xyxy[i].detach().round().to(torch.int64).tolist()
+                x1 = max(0, min(width, x1))
+                x2 = max(0, min(width, x2))
+                y1 = max(0, min(height, y1))
+                y2 = max(0, min(height, y2))
+                if x2 > x1 and y2 > y1:
+                    mask_i[:, y1:y2, x1:x2] = conf
+
+            if mask_i.max() > 0:
+                candidates.append((float(conf.detach().item()), conf, mask_i))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        blur = GaussianBlur(kernel_size=kernel_size, sigma=float(sigma)) if kernel_size > 1 else None
+        for out_idx, (_, conf, mask_i) in enumerate(candidates[:max_instances]):
+            if blur is not None:
+                mask_i = blur(mask_i.unsqueeze(0)).squeeze(0)
+            instance_masks[out_idx] = torch.clamp(mask_i, 0.0, 1.0)
+            confidences[out_idx] = conf.view(1, 1, 1)
+            valid[out_idx] = 1.0
+
+        batched_masks.append(instance_masks.to(device=default_device))
+        batched_confs.append(confidences.to(device=default_device))
+        batched_valid.append(valid.to(device=default_device))
+
+    return (
+        torch.stack(batched_masks, dim=0),
+        torch.stack(batched_confs, dim=0),
+        torch.stack(batched_valid, dim=0),
+    )
+
+
 def make_mask_guided_background_augmentation(
     images: torch.Tensor,
     masks: torch.Tensor,
@@ -302,6 +427,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self.latest_debug: dict[str, float] = {}
         self.latest_consistency: dict[str, torch.Tensor] = {}
         self.latest_target_token_debug: dict[str, torch.Tensor | None] = {}
+        self.latest_instance_object_token_debug: dict[str, torch.Tensor | None] = {}
         self.latest_mask_geometry_debug: dict[str, torch.Tensor | None] = {}
 
         hidden_dim = int(config.adapter_hidden_dim)
@@ -367,6 +493,7 @@ class MaskGuidedVisualAdapter(nn.Module):
             self.register_parameter("region_attention_scale", None)
 
         self.num_target_tokens = max(0, int(config.num_target_tokens))
+        self.max_instance_object_tokens = max(0, int(config.max_instance_object_tokens))
         if config.use_target_tokens and self.num_target_tokens > 0:
             self.target_token_proj = nn.Sequential(
                 nn.LayerNorm(dim_model),
@@ -401,11 +528,26 @@ class MaskGuidedVisualAdapter(nn.Module):
             else:
                 self.target_object_perceiver = None
                 self.register_parameter("target_token_attention_scale", None)
+
+            if config.use_instance_object_tokens and self.max_instance_object_tokens > 0:
+                self.instance_object_token_scale = nn.Parameter(
+                    torch.tensor(float(config.instance_object_token_gate_init))
+                )
+                self.register_buffer(
+                    "instance_object_token_pos_embed",
+                    torch.zeros(self.max_instance_object_tokens, 1, dim_model),
+                    persistent=False,
+                )
+            else:
+                self.register_parameter("instance_object_token_scale", None)
+                self.register_buffer("instance_object_token_pos_embed", None, persistent=False)
         else:
             self.target_token_proj = None
             self.target_object_perceiver = None
             self.register_parameter("target_token_pos_embed", None)
             self.register_parameter("target_token_attention_scale", None)
+            self.register_parameter("instance_object_token_scale", None)
+            self.register_buffer("instance_object_token_pos_embed", None, persistent=False)
 
         if config.use_mask_geometry_token:
             self.mask_geometry_token_proj = nn.Sequential(
@@ -651,6 +793,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_mask: torch.Tensor,
         context_mask: torch.Tensor,
         record_debug: bool,
+        token_gate: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if self.target_object_perceiver is None:
             return token_seed, None, None
@@ -672,8 +815,13 @@ class MaskGuidedVisualAdapter(nn.Module):
                 need_weights=record_debug,
             )
         attn_delta = refined_tokens - token_seed
-        reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
-        token_gate = reliability_gate.view(1, batch_size, 1)
+        if token_gate is None:
+            reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
+            token_gate = reliability_gate.view(1, batch_size, 1)
+        else:
+            token_gate = token_gate.to(dtype=features.dtype, device=features.device)
+            if not self.use_reliability_gate:
+                token_gate = torch.ones_like(token_gate)
         attn_delta = self.target_token_attention_scale * token_gate * attn_delta
         return token_seed + attn_delta, attn_delta, attn_weights
 
@@ -715,6 +863,138 @@ class MaskGuidedVisualAdapter(nn.Module):
             "context_mask": context_mask.detach(),
         }
         return target_tokens, target_pos_embed
+
+    def _prepare_instance_masks(
+        self,
+        instance_masks: torch.Tensor | None,
+        features: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.instance_object_token_scale is None or instance_masks is None:
+            return None
+
+        if instance_masks.ndim == 4:
+            instance_masks = instance_masks.unsqueeze(2)
+        if instance_masks.ndim != 5 or instance_masks.shape[2] != 1:
+            raise ValueError(
+                "instance_masks must have shape [B, N, 1, H, W] or [B, N, H, W], "
+                f"got {tuple(instance_masks.shape)}."
+            )
+        if instance_masks.shape[0] != features.shape[0]:
+            raise ValueError("instance_masks and visual features must have the same batch size.")
+
+        batch_size, num_instances, _, mask_h, mask_w = instance_masks.shape
+        max_instances = self.max_instance_object_tokens
+        if num_instances > max_instances:
+            instance_masks = instance_masks[:, :max_instances]
+        elif num_instances < max_instances:
+            pad = torch.zeros(
+                batch_size,
+                max_instances - num_instances,
+                1,
+                mask_h,
+                mask_w,
+                dtype=instance_masks.dtype,
+                device=instance_masks.device,
+            )
+            instance_masks = torch.cat([instance_masks, pad], dim=1)
+
+        instance_masks = instance_masks.to(dtype=features.dtype, device=features.device)
+        if instance_masks.shape[-2:] != features.shape[-2:]:
+            flat_masks = instance_masks.reshape(batch_size * max_instances, 1, mask_h, mask_w)
+            flat_masks = F.interpolate(
+                flat_masks,
+                size=features.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            instance_masks = flat_masks.reshape(batch_size, max_instances, 1, *features.shape[-2:])
+        return torch.clamp(instance_masks, 0.0, 1.0)
+
+    def _make_instance_object_tokens(
+        self,
+        features: torch.Tensor,
+        instance_masks: torch.Tensor | None,
+        record_debug: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        instance_masks = self._prepare_instance_masks(instance_masks, features)
+        if self.instance_object_token_scale is None or instance_masks is None or self.target_token_proj is None:
+            self.latest_instance_object_token_debug = {}
+            return None, None
+
+        batch_size, num_instances, _, height, width = instance_masks.shape
+        weights = torch.clamp(instance_masks, 0.0, 1.0)
+        denom = weights.sum(dim=(3, 4)).clamp(min=1e-6)
+        pooled = (features.unsqueeze(1) * weights).sum(dim=(3, 4)) / denom
+        instance_tokens = pooled.permute(1, 0, 2)
+        instance_tokens = instance_tokens + self.target_token_proj(instance_tokens)
+
+        flat_masks = weights.reshape(batch_size * num_instances, 1, height, width)
+        reliability, confidence_score, mask_area = self._compute_reliability(flat_masks)
+        reliability = reliability.reshape(batch_size, num_instances, 1)
+        confidence_score = confidence_score.reshape(batch_size, num_instances, 1)
+        mask_area = mask_area.reshape(batch_size, num_instances, 1)
+        valid = (
+            (confidence_score > 0.0)
+            & (mask_area >= float(self.config.instance_object_token_min_area))
+        ).to(dtype=features.dtype)
+        token_gate = reliability * valid
+        token_gate_t = token_gate.permute(1, 0, 2)
+
+        attention_delta = None
+        attention_weights = None
+        if self.target_object_perceiver is not None:
+            token_masks = [weights[:, i] for i in range(num_instances)]
+            union_instance_mask = torch.clamp(weights.max(dim=1).values, 0.0, 1.0)
+            instance_tokens, attention_delta, attention_weights = self._apply_target_token_attention(
+                features,
+                instance_tokens,
+                token_masks,
+                reliability=torch.ones(
+                    batch_size,
+                    1,
+                    1,
+                    1,
+                    dtype=features.dtype,
+                    device=features.device,
+                ),
+                target_mask=union_instance_mask,
+                context_mask=torch.zeros_like(union_instance_mask),
+                record_debug=record_debug,
+                token_gate=token_gate_t,
+            )
+
+        instance_tokens = self.instance_object_token_scale * token_gate_t * instance_tokens
+        instance_pos_embed = self.instance_object_token_pos_embed.to(
+            dtype=features.dtype,
+            device=features.device,
+        )
+
+        self.latest_instance_object_token_debug = {
+            "tokens": instance_tokens.detach(),
+            "masks": weights.detach(),
+            "valid": valid.detach(),
+            "attention_delta": attention_delta,
+            "attention_weights": attention_weights,
+            "confidence": confidence_score.detach(),
+            "area": mask_area.detach(),
+        }
+        return instance_tokens, instance_pos_embed
+
+    @staticmethod
+    def _concat_optional_tokens(
+        first_tokens: torch.Tensor | None,
+        first_pos_embed: torch.Tensor | None,
+        second_tokens: torch.Tensor | None,
+        second_pos_embed: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if first_tokens is None:
+            return second_tokens, second_pos_embed
+        if second_tokens is None:
+            return first_tokens, first_pos_embed
+        return (
+            torch.cat([first_tokens, second_tokens], dim=0),
+            torch.cat([first_pos_embed, second_pos_embed], dim=0),
+        )
 
     def _make_consistency_data(
         self,
@@ -788,6 +1068,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self,
         visual_features: torch.Tensor,
         mask: torch.Tensor,
+        instance_masks: torch.Tensor | None = None,
         record_debug: bool = True,
     ) -> tuple[
         torch.Tensor,
@@ -839,6 +1120,17 @@ class MaskGuidedVisualAdapter(nn.Module):
             background_mask,
             reliability,
             record_debug=record_debug,
+        )
+        instance_tokens, instance_pos_embed = self._make_instance_object_tokens(
+            guided_features,
+            instance_masks,
+            record_debug=record_debug,
+        )
+        target_tokens, target_pos_embed = self._concat_optional_tokens(
+            target_tokens,
+            target_pos_embed,
+            instance_tokens,
+            instance_pos_embed,
         )
         mask_geometry_token, mask_geometry_pos_embed = self._make_mask_geometry_token(
             guided_features,
@@ -905,6 +1197,42 @@ class MaskGuidedVisualAdapter(nn.Module):
                 if target_token_attention_delta is None
                 else target_token_attention_delta.detach().float().pow(2).mean().sqrt()
             )
+            instance_debug = self.latest_instance_object_token_debug
+            instance_attention_delta = instance_debug.get("attention_delta")
+            instance_attention_delta_rms = (
+                torch.zeros((), device=visual_features.device)
+                if instance_attention_delta is None
+                else instance_attention_delta.detach().float().pow(2).mean().sqrt()
+            )
+            instance_tokens_debug = instance_debug.get("tokens")
+            instance_token_norm = (
+                torch.zeros((), device=visual_features.device)
+                if instance_tokens_debug is None
+                else instance_tokens_debug.detach().float().pow(2).mean().sqrt()
+            )
+            instance_valid = instance_debug.get("valid")
+            instance_area = instance_debug.get("area")
+            instance_confidence = instance_debug.get("confidence")
+            instance_valid_count = (
+                torch.zeros((), device=visual_features.device)
+                if instance_valid is None
+                else instance_valid.detach().float().sum(dim=1).mean()
+            )
+            instance_valid_ratio = (
+                torch.zeros((), device=visual_features.device)
+                if instance_valid is None
+                else instance_valid.detach().float().mean()
+            )
+            instance_area_mean = (
+                torch.zeros((), device=visual_features.device)
+                if instance_area is None
+                else instance_area.detach().float().mean()
+            )
+            instance_confidence_mean = (
+                torch.zeros((), device=visual_features.device)
+                if instance_confidence is None
+                else instance_confidence.detach().float().mean()
+            )
             mask_geometry_debug = self.latest_mask_geometry_debug
             mask_geometry_values = mask_geometry_debug.get("geometry")
             mask_geometry_token_debug = mask_geometry_debug.get("geometry_token")
@@ -928,6 +1256,14 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "object_perceiver_layers": float(
                     0 if self.target_object_perceiver is None else len(self.target_object_perceiver)
                 ),
+                "instance_object_tokens": float(self.max_instance_object_tokens),
+                "instance_object_valid_count": float(instance_valid_count.item()),
+                "instance_object_valid_ratio": float(instance_valid_ratio.item()),
+                "instance_object_area_mean": float(instance_area_mean.item()),
+                "instance_object_confidence_mean": float(instance_confidence_mean.item()),
+                "instance_object_token_norm": float(instance_token_norm.item()),
+                "instance_object_token_delta_rms": float(instance_attention_delta_rms.item()),
+                "instance_object_token_delta_ratio": float((instance_attention_delta_rms / visual_rms).item()),
                 "target_token_geometry_norm": 0.0,
                 "mask_geometry_token_norm": float(mask_geometry_token_norm.item()),
                 "output_delta_rms": float(output_delta_rms.item()),
@@ -980,6 +1316,10 @@ class MaskGuidedVisualAdapter(nn.Module):
                 self.latest_debug["object_perceiver_gate"] = float(
                     self.target_token_attention_scale.detach().item()
                 )
+            if self.instance_object_token_scale is not None:
+                self.latest_debug["instance_object_token_gate"] = float(
+                    self.instance_object_token_scale.detach().item()
+                )
             target_token_attention_weights = target_token_debug.get("attention_weights")
             if isinstance(target_token_attention_weights, torch.Tensor):
                 attn_float = target_token_attention_weights.detach().float()
@@ -993,4 +1333,18 @@ class MaskGuidedVisualAdapter(nn.Module):
                     self.latest_debug["target_token_context_attn_mean"] = float(
                         (attn_float[:, 1, :] * context_flat).sum(dim=1).mean().item()
                     )
+            instance_attention_weights = instance_debug.get("attention_weights")
+            instance_masks = instance_debug.get("masks")
+            instance_valid = instance_debug.get("valid")
+            if isinstance(instance_attention_weights, torch.Tensor) and isinstance(instance_masks, torch.Tensor):
+                inst_attn = instance_attention_weights.detach().float()
+                inst_masks = instance_masks.detach().float().flatten(3).squeeze(2)
+                inst_mass = (inst_attn * inst_masks).sum(dim=2)
+                if isinstance(instance_valid, torch.Tensor):
+                    valid_flat = instance_valid.detach().float().squeeze(-1)
+                    denom = valid_flat.sum().clamp(min=1.0)
+                    inst_attn_mean = (inst_mass * valid_flat).sum() / denom
+                else:
+                    inst_attn_mean = inst_mass.mean()
+                self.latest_debug["instance_object_attn_mask_mean"] = float(inst_attn_mean.item())
         return guided_features, target_tokens, target_pos_embed, mask_geometry_token, mask_geometry_pos_embed

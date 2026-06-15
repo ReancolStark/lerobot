@@ -8,6 +8,7 @@ from lerobot.policies.customACT.mask_weight.configuration_mask_weight import Mas
 from lerobot.policies.customACT.mask_weight.mask_weight import (
     MaskGuidedVisualAdapter,
     make_mask_guided_background_augmentation,
+    yolo_results_to_instance_masks,
 )
 
 
@@ -37,6 +38,11 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.mask_geometry_token_gate_init == pytest.approx(0.2)
     assert config.target_background_contrastive_loss_weight == pytest.approx(0.02)
     assert config.target_background_contrastive_margin == pytest.approx(0.2)
+    assert config.use_instance_object_tokens is True
+    assert config.max_instance_object_tokens == 4
+    assert config.instance_object_token_gate_init == pytest.approx(0.1)
+    assert config.instance_object_token_min_area == pytest.approx(0.001)
+    assert config.instance_object_token_mask_bias_scale == pytest.approx(2.0)
 
 
 def test_mask_guided_visual_adapter_shapes_and_gradient():
@@ -165,6 +171,14 @@ def test_mask_weight_config_rejects_invalid_v4_params():
     with pytest.raises(ValueError):
         MaskWeightConfig(mask_geometry_token_gate_init=-0.1)
     with pytest.raises(ValueError):
+        MaskWeightConfig(max_instance_object_tokens=-1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(instance_object_token_gate_init=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(instance_object_token_min_area=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(instance_object_token_mask_bias_scale=-0.1)
+    with pytest.raises(ValueError):
         MaskWeightConfig(background_feature_consistency_loss_weight=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(background_token_consistency_loss_weight=-0.1)
@@ -202,6 +216,105 @@ def test_target_token_attention_can_be_disabled_for_ablation():
     assert adapter.latest_debug["object_perceiver_layers"] == pytest.approx(0.0)
     assert adapter.latest_debug["target_token_geometry_norm"] == pytest.approx(0.0)
     assert adapter.latest_debug["mask_geometry_token_norm"] >= 0.0
+
+
+def test_instance_object_tokens_append_to_target_tokens_and_have_gradients():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        use_target_tokens=True,
+        num_target_tokens=2,
+        max_instance_object_tokens=3,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+
+    features = torch.randn(2, 8, 5, 6)
+    mask = torch.zeros(2, 1, 5, 6)
+    mask[:, :, 1:4, 2:5] = 1.0
+    instance_masks = torch.zeros(2, 3, 1, 5, 6)
+    instance_masks[:, 0, :, 1:3, 2:4] = 1.0
+    instance_masks[:, 1, :, 3:5, 3:5] = 0.8
+
+    _, target_tokens, target_pos_embed, _, _ = adapter(features, mask, instance_masks=instance_masks)
+
+    assert target_tokens.shape == (5, 2, 8)
+    assert target_pos_embed.shape == (5, 1, 8)
+    assert adapter.latest_consistency["target_tokens"].shape == (5, 2, 8)
+    assert adapter.latest_debug["instance_object_tokens"] == pytest.approx(3.0)
+    assert adapter.latest_debug["instance_object_valid_count"] == pytest.approx(2.0)
+    assert adapter.latest_debug["instance_object_valid_ratio"] == pytest.approx(2.0 / 3.0)
+    assert adapter.latest_debug["instance_object_token_gate"] == pytest.approx(
+        config.instance_object_token_gate_init
+    )
+    assert adapter.latest_debug["instance_object_token_norm"] >= 0.0
+    assert 0.0 <= adapter.latest_debug["instance_object_attn_mask_mean"] <= 1.0
+
+    target_tokens.mean().backward()
+    assert adapter.instance_object_token_scale.grad is not None
+    assert adapter.target_object_perceiver[0].cross_attn.in_proj_weight.grad is not None
+
+
+def test_empty_instance_object_tokens_do_not_inject_signal():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        use_target_tokens=True,
+        max_instance_object_tokens=2,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+    adapter.eval()
+
+    features = torch.randn(2, 8, 5, 6)
+    mask = torch.zeros(2, 1, 5, 6)
+    instance_masks = torch.zeros(2, 2, 1, 5, 6)
+
+    guided_features, target_tokens, target_pos_embed, mask_geometry_token, _ = adapter(
+        features,
+        mask,
+        instance_masks=instance_masks,
+    )
+
+    assert torch.allclose(guided_features, features)
+    assert target_tokens.shape == (4, 2, 8)
+    assert torch.allclose(target_tokens, torch.zeros_like(target_tokens))
+    assert target_pos_embed.shape == (4, 1, 8)
+    assert torch.allclose(mask_geometry_token, torch.zeros_like(mask_geometry_token))
+    assert adapter.latest_debug["instance_object_valid_count"] == pytest.approx(0.0)
+    assert adapter.latest_debug["instance_object_token_norm"] == pytest.approx(0.0)
+
+
+def test_yolo_results_to_instance_masks_uses_box_fallback_and_confidence_order():
+    class FakeBoxes:
+        def __init__(self):
+            self.conf = torch.tensor([0.2, 0.9, 0.5])
+            self.xyxy = torch.tensor(
+                [
+                    [0.0, 0.0, 2.0, 2.0],
+                    [1.0, 1.0, 4.0, 4.0],
+                    [2.0, 0.0, 5.0, 2.0],
+                ]
+            )
+
+        def __len__(self):
+            return int(self.conf.numel())
+
+    result = SimpleNamespace(orig_shape=(6, 6), masks=None, boxes=FakeBoxes())
+
+    instance_masks, confidences, valid = yolo_results_to_instance_masks(
+        [result],
+        max_instances=2,
+        kernel_size=1,
+    )
+
+    assert instance_masks.shape == (1, 2, 1, 6, 6)
+    assert confidences.flatten().tolist() == pytest.approx([0.9, 0.5])
+    assert valid.flatten().tolist() == pytest.approx([1.0, 1.0])
+    assert instance_masks[0, 0].max().item() == pytest.approx(0.9)
+    assert instance_masks[0, 1].max().item() == pytest.approx(0.5)
 
 
 def test_mask_geometry_token_can_be_disabled_for_ablation():

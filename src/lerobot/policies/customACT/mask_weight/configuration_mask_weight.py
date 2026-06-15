@@ -27,6 +27,15 @@ class MaskWeightConfig:
     target_object_perceiver_dropout: float = 0.0
     mask_geometry_token_gate_init: float = 0.2
 
+    # Instance-level object tokens. The union mask remains the stable dense
+    # guidance/background-consistency signal; these tokens expose individual
+    # YOLO instances to the ACT encoder.
+    use_instance_object_tokens: bool = True
+    max_instance_object_tokens: int = 4
+    instance_object_token_gate_init: float = 0.1
+    instance_object_token_min_area: float = 0.001
+    instance_object_token_mask_bias_scale: float = 2.0
+
     # YOLO mask post-processing.
     mask_blur_kernel_size: int = 7
     mask_blur_sigma: float = 2.0
@@ -160,3 +169,11 @@ class MaskWeightConfig:
             raise ValueError("num_target_tokens must be non-negative.")
         if self.mask_geometry_token_gate_init < 0.0:
             raise ValueError("mask_geometry_token_gate_init must be non-negative.")
+        if self.max_instance_object_tokens < 0:
+            raise ValueError("max_instance_object_tokens must be non-negative.")
+        if self.instance_object_token_gate_init < 0.0:
+            raise ValueError("instance_object_token_gate_init must be non-negative.")
+        if not 0.0 <= self.instance_object_token_min_area <= 1.0:
+            raise ValueError("instance_object_token_min_area must be in [0, 1].")
+        if self.instance_object_token_mask_bias_scale < 0.0:
+            raise ValueError("instance_object_token_mask_bias_scale must be non-negative.")
