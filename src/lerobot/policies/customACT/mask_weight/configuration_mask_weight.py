@@ -27,6 +27,18 @@ class MaskWeightConfig:
     target_object_perceiver_dropout: float = 0.0
     mask_geometry_token_gate_init: float = 0.2
 
+    # V4.7 object-weighted mask. This does not add ACT encoder tokens; it learns
+    # which YOLO instances should contribute to the mask that feeds the v4.2 path.
+    use_object_weighted_mask: bool = True
+    max_object_weight_instances: int = 8
+    object_weight_embed_dim: int = 64
+    object_weight_hidden_dim: int = 128
+    object_weight_relation_layers: int = 1
+    object_weight_attention_heads: int = 4
+    object_weight_init: float = 0.9
+    object_weight_union_floor: float = 0.25
+    num_yolo_classes: int | None = None
+
     # YOLO mask post-processing.
     mask_blur_kernel_size: int = 7
     mask_blur_sigma: float = 2.0
@@ -160,3 +172,21 @@ class MaskWeightConfig:
             raise ValueError("num_target_tokens must be non-negative.")
         if self.mask_geometry_token_gate_init < 0.0:
             raise ValueError("mask_geometry_token_gate_init must be non-negative.")
+        if self.max_object_weight_instances < 0:
+            raise ValueError("max_object_weight_instances must be non-negative.")
+        if self.object_weight_embed_dim <= 0:
+            raise ValueError("object_weight_embed_dim must be positive.")
+        if self.object_weight_hidden_dim <= 0:
+            raise ValueError("object_weight_hidden_dim must be positive.")
+        if self.object_weight_relation_layers < 0:
+            raise ValueError("object_weight_relation_layers must be non-negative.")
+        if self.object_weight_attention_heads <= 0:
+            raise ValueError("object_weight_attention_heads must be positive.")
+        if self.object_weight_hidden_dim % self.object_weight_attention_heads != 0:
+            raise ValueError("object_weight_attention_heads must divide object_weight_hidden_dim.")
+        if not 0.0 < self.object_weight_init < 1.0:
+            raise ValueError("object_weight_init must be in (0, 1).")
+        if not 0.0 <= self.object_weight_union_floor <= 1.0:
+            raise ValueError("object_weight_union_floor must be in [0, 1].")
+        if self.num_yolo_classes is not None and self.num_yolo_classes <= 0:
+            raise ValueError("num_yolo_classes must be positive or None.")

@@ -8,6 +8,7 @@ from lerobot.policies.customACT.mask_weight.configuration_mask_weight import Mas
 from lerobot.policies.customACT.mask_weight.mask_weight import (
     MaskGuidedVisualAdapter,
     make_mask_guided_background_augmentation,
+    yolo_results_to_object_weight_inputs,
 )
 
 
@@ -37,6 +38,15 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.mask_geometry_token_gate_init == pytest.approx(0.2)
     assert config.target_background_contrastive_loss_weight == pytest.approx(0.02)
     assert config.target_background_contrastive_margin == pytest.approx(0.2)
+    assert config.use_object_weighted_mask is True
+    assert config.max_object_weight_instances == 8
+    assert config.object_weight_embed_dim == 64
+    assert config.object_weight_hidden_dim == 128
+    assert config.object_weight_relation_layers == 1
+    assert config.object_weight_attention_heads == 4
+    assert config.object_weight_init == pytest.approx(0.9)
+    assert config.object_weight_union_floor == pytest.approx(0.25)
+    assert config.num_yolo_classes is None
 
 
 def test_mask_guided_visual_adapter_shapes_and_gradient():
@@ -165,6 +175,24 @@ def test_mask_weight_config_rejects_invalid_v4_params():
     with pytest.raises(ValueError):
         MaskWeightConfig(mask_geometry_token_gate_init=-0.1)
     with pytest.raises(ValueError):
+        MaskWeightConfig(max_object_weight_instances=-1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_weight_embed_dim=0)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_weight_hidden_dim=0)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_weight_relation_layers=-1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_weight_attention_heads=0)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_weight_hidden_dim=10, object_weight_attention_heads=4)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_weight_init=1.0)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_weight_union_floor=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(num_yolo_classes=0)
+    with pytest.raises(ValueError):
         MaskWeightConfig(background_feature_consistency_loss_weight=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(background_token_consistency_loss_weight=-0.1)
@@ -228,6 +256,153 @@ def test_mask_geometry_token_can_be_disabled_for_ablation():
     assert adapter.mask_geometry_token_proj is None
     assert adapter.mask_geometry_token_scale is None
     assert adapter.latest_debug["mask_geometry_token_norm"] == pytest.approx(0.0)
+
+
+def test_object_weighted_mask_can_be_disabled_for_v42_behavior():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        use_object_weighted_mask=False,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+
+    features = torch.randn(2, 8, 5, 6)
+    union_mask = torch.zeros(2, 1, 5, 6)
+    union_mask[:, :, 1:4, 2:5] = 1.0
+    object_inputs = {
+        "instance_masks": torch.zeros(2, 2, 1, 5, 6),
+        "class_ids": torch.zeros(2, 2, dtype=torch.long),
+        "confidences": torch.zeros(2, 2),
+        "valid": torch.zeros(2, 2),
+    }
+
+    _, target_tokens, target_pos_embed, _, _ = adapter(
+        features,
+        union_mask,
+        object_weight_inputs=object_inputs,
+    )
+
+    assert adapter.object_weight_net is None
+    assert torch.allclose(adapter.latest_object_weighted_mask, union_mask)
+    assert target_tokens.shape == (2, 2, 8)
+    assert target_pos_embed.shape == (2, 1, 8)
+
+
+def test_object_weighted_mask_preserves_v42_token_count_and_gets_gradients():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        num_yolo_classes=4,
+        max_object_weight_instances=3,
+        object_weight_embed_dim=4,
+        object_weight_hidden_dim=8,
+        object_weight_attention_heads=2,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+
+    features = torch.randn(2, 8, 5, 6)
+    union_mask = torch.zeros(2, 1, 5, 6)
+    union_mask[:, :, 1:4, 2:5] = 1.0
+    instance_masks = torch.zeros(2, 3, 1, 5, 6)
+    instance_masks[:, 0, :, 1:4, 2:5] = 1.0
+    instance_masks[:, 1, :, 0:2, 0:2] = 0.8
+    object_inputs = {
+        "instance_masks": instance_masks,
+        "class_ids": torch.tensor([[1, 2, 0], [1, 2, 0]]),
+        "confidences": torch.tensor([[0.9, 0.6, 0.0], [0.9, 0.6, 0.0]]),
+        "valid": torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 0.0]]),
+    }
+
+    _, target_tokens, target_pos_embed, mask_geometry_token, _ = adapter(
+        features,
+        union_mask,
+        object_weight_inputs=object_inputs,
+    )
+
+    assert target_tokens.shape == (2, 2, 8)
+    assert target_pos_embed.shape == (2, 1, 8)
+    assert adapter.latest_consistency["target_tokens"].shape == (2, 2, 8)
+    assert adapter.latest_debug["object_weight_valid_count"] == pytest.approx(2.0)
+    assert adapter.latest_debug["object_weight_mean"] == pytest.approx(config.object_weight_init, abs=0.02)
+    assert adapter.latest_debug["object_weight_final_mask_mean"] > 0.0
+    assert adapter.latest_debug["object_weight_weighted_mask_mean"] > adapter.latest_debug["object_weight_floor"] * 0.0
+    assert 1.0 <= adapter.latest_debug["object_weight_top_class"] <= 2.0
+    assert adapter.latest_debug["object_weight_top_confidence"] > 0.0
+
+    (target_tokens.mean() + mask_geometry_token.mean()).backward()
+    assert adapter.object_weight_net.output[-1].weight.grad is not None
+    assert adapter.object_weight_net.class_embed.weight.grad is not None
+
+
+def test_empty_object_weight_inputs_do_not_inject_mask():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        use_target_tokens=True,
+        num_yolo_classes=4,
+        max_object_weight_instances=2,
+        object_weight_embed_dim=4,
+        object_weight_hidden_dim=8,
+        object_weight_attention_heads=2,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+    adapter.eval()
+
+    features = torch.randn(2, 8, 5, 6)
+    union_mask = torch.zeros(2, 1, 5, 6)
+    object_inputs = {
+        "instance_masks": torch.zeros(2, 2, 1, 5, 6),
+        "class_ids": torch.zeros(2, 2, dtype=torch.long),
+        "confidences": torch.zeros(2, 2),
+        "valid": torch.zeros(2, 2),
+    }
+
+    guided_features, target_tokens, _, mask_geometry_token, _ = adapter(
+        features,
+        union_mask,
+        object_weight_inputs=object_inputs,
+    )
+
+    assert torch.allclose(guided_features, features)
+    assert torch.allclose(target_tokens, torch.zeros_like(target_tokens))
+    assert torch.allclose(mask_geometry_token, torch.zeros_like(mask_geometry_token))
+    assert torch.allclose(adapter.latest_object_weighted_mask, union_mask)
+    assert adapter.latest_debug["object_weight_valid_count"] == pytest.approx(0.0)
+    assert adapter.latest_debug["object_weight_mean"] == pytest.approx(0.0)
+
+
+def test_yolo_results_to_object_weight_inputs_uses_box_fallback_and_confidence_order():
+    class FakeBoxes:
+        def __init__(self):
+            self.conf = torch.tensor([0.2, 0.9, 0.5])
+            self.cls = torch.tensor([3, 1, 2])
+            self.xyxy = torch.tensor(
+                [
+                    [0.0, 0.0, 2.0, 2.0],
+                    [1.0, 1.0, 4.0, 4.0],
+                    [2.0, 0.0, 5.0, 2.0],
+                ]
+            )
+
+        def __len__(self):
+            return int(self.conf.numel())
+
+    result = SimpleNamespace(orig_shape=(6, 6), masks=None, boxes=FakeBoxes())
+
+    object_inputs = yolo_results_to_object_weight_inputs([result], max_instances=2, kernel_size=1)
+
+    assert object_inputs["instance_masks"].shape == (1, 2, 1, 6, 6)
+    assert object_inputs["confidences"].flatten().tolist() == pytest.approx([0.9, 0.5])
+    assert object_inputs["class_ids"].flatten().tolist() == [1, 2]
+    assert object_inputs["valid"].flatten().tolist() == pytest.approx([1.0, 1.0])
+    assert object_inputs["instance_masks"][0, 0].max().item() == pytest.approx(0.9)
+    assert object_inputs["instance_masks"][0, 1].max().item() == pytest.approx(0.5)
 
 
 def test_region_attention_reliability_gate_falls_back_on_empty_mask():
