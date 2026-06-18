@@ -336,6 +336,54 @@ def test_object_weighted_mask_preserves_v42_token_count_and_gets_gradients():
     (target_tokens.mean() + mask_geometry_token.mean()).backward()
     assert adapter.object_weight_net.output[-1].weight.grad is not None
     assert adapter.object_weight_net.class_embed.weight.grad is not None
+    assert torch.isfinite(adapter.object_weight_net.output[-1].weight.grad).all()
+    assert torch.isfinite(adapter.object_weight_net.class_embed.weight.grad).all()
+
+
+def test_object_weighted_mask_padding_slots_have_finite_gradients():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        num_yolo_classes=4,
+        max_object_weight_instances=8,
+        object_weight_embed_dim=4,
+        object_weight_hidden_dim=8,
+        object_weight_attention_heads=2,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+
+    features = torch.randn(2, 8, 5, 6, requires_grad=True)
+    instance_masks = torch.zeros(2, 8, 1, 5, 6)
+    instance_masks[:, 0, :, 1:4, 2:5] = 0.9
+    union_mask = instance_masks.amax(dim=1)
+    object_inputs = {
+        "instance_masks": instance_masks,
+        "class_ids": torch.zeros(2, 8, dtype=torch.long),
+        "confidences": torch.zeros(2, 8),
+        "valid": torch.zeros(2, 8),
+    }
+    object_inputs["class_ids"][:, 0] = 1
+    object_inputs["confidences"][:, 0] = 0.9
+    object_inputs["valid"][:, 0] = 1.0
+
+    guided_features, target_tokens, _, mask_geometry_token, _ = adapter(
+        features,
+        union_mask,
+        object_weight_inputs=object_inputs,
+    )
+    loss = guided_features.square().mean() + target_tokens.square().mean() + mask_geometry_token.square().mean()
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(features.grad).all()
+    assert adapter.latest_debug["object_weight_valid_count"] == pytest.approx(1.0)
+    assert adapter.latest_debug["object_weight_mean"] == pytest.approx(config.object_weight_init, abs=0.02)
+    assert adapter.latest_debug["object_weight_final_mask_mean"] > 0.0
+    for name, parameter in adapter.object_weight_net.named_parameters():
+        if parameter.grad is not None:
+            assert torch.isfinite(parameter.grad).all(), name
 
 
 def test_empty_object_weight_inputs_do_not_inject_mask():

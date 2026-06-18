@@ -430,7 +430,22 @@ class ObjectWeightRelationLayer(nn.Module):
         valid_gate = valid.unsqueeze(-1).to(dtype=tokens.dtype)
         tokens = tokens * valid_gate
         attn_in = self.self_norm(tokens)
-        attn_out, _ = self.self_attn(attn_in, attn_in, attn_in, need_weights=False)
+        key_padding_mask = valid <= 0.0
+        if key_padding_mask.any():
+            key_padding_mask = key_padding_mask.bool()
+            all_padded = key_padding_mask.all(dim=1)
+            if all_padded.any():
+                key_padding_mask = key_padding_mask.clone()
+                key_padding_mask[all_padded, 0] = False
+        else:
+            key_padding_mask = None
+        attn_out, _ = self.self_attn(
+            attn_in,
+            attn_in,
+            attn_in,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         tokens = (tokens + attn_out) * valid_gate
         tokens = (tokens + self.ffn(self.ffn_norm(tokens))) * valid_gate
         return tokens
@@ -809,14 +824,17 @@ class MaskGuidedVisualAdapter(nn.Module):
         y_coords = torch.linspace(0.0, 1.0, height, dtype=dtype, device=device).view(1, 1, 1, height, 1)
 
         weights = torch.clamp(instance_masks, 0.0, 1.0)
-        denom = weights.sum(dim=(2, 3, 4), keepdim=True).clamp(min=1e-6)
-        has_mask = (denom > 1e-6).to(dtype=dtype)
+        raw_denom = weights.sum(dim=(2, 3, 4), keepdim=True)
+        has_mask = (raw_denom > 1e-6).to(dtype=dtype)
+        denom = raw_denom.clamp(min=1e-6)
         center_x = (weights * x_coords).sum(dim=(2, 3, 4), keepdim=True) / denom
         center_y = (weights * y_coords).sum(dim=(2, 3, 4), keepdim=True) / denom
         center_x = torch.where(has_mask.bool(), center_x, torch.full_like(center_x, 0.5))
         center_y = torch.where(has_mask.bool(), center_y, torch.full_like(center_y, 0.5))
-        spread_x = ((weights * (x_coords - center_x).pow(2)).sum(dim=(2, 3, 4), keepdim=True) / denom).sqrt()
-        spread_y = ((weights * (y_coords - center_y).pow(2)).sum(dim=(2, 3, 4), keepdim=True) / denom).sqrt()
+        var_x = (weights * (x_coords - center_x).pow(2)).sum(dim=(2, 3, 4), keepdim=True) / denom
+        var_y = (weights * (y_coords - center_y).pow(2)).sum(dim=(2, 3, 4), keepdim=True) / denom
+        spread_x = var_x.clamp(min=1e-12).sqrt() * has_mask
+        spread_y = var_y.clamp(min=1e-12).sqrt() * has_mask
         area = weights.mean(dim=(2, 3, 4), keepdim=True)
         geometry = torch.cat(
             [
@@ -824,8 +842,8 @@ class MaskGuidedVisualAdapter(nn.Module):
                 area,
                 center_x,
                 center_y,
-                spread_x * has_mask,
-                spread_y * has_mask,
+                spread_x,
+                spread_y,
             ],
             dim=2,
         )
@@ -953,18 +971,19 @@ class MaskGuidedVisualAdapter(nn.Module):
 
         weights = torch.clamp(target_mask, 0.0, 1.0)
         area = weights.mean(dim=(2, 3), keepdim=True)
-        denom = weights.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
-        has_mask = (denom > 1e-6).to(dtype=dtype)
+        raw_denom = weights.sum(dim=(2, 3), keepdim=True)
+        has_mask = (raw_denom > 1e-6).to(dtype=dtype)
+        denom = raw_denom.clamp(min=1e-6)
 
         center_x = (weights * x_coords).sum(dim=(2, 3), keepdim=True) / denom
         center_y = (weights * y_coords).sum(dim=(2, 3), keepdim=True) / denom
         center_x = torch.where(has_mask.bool(), center_x, torch.full_like(center_x, 0.5))
         center_y = torch.where(has_mask.bool(), center_y, torch.full_like(center_y, 0.5))
 
-        spread_x = ((weights * (x_coords - center_x).pow(2)).sum(dim=(2, 3), keepdim=True) / denom).sqrt()
-        spread_y = ((weights * (y_coords - center_y).pow(2)).sum(dim=(2, 3), keepdim=True) / denom).sqrt()
-        spread_x = spread_x * has_mask
-        spread_y = spread_y * has_mask
+        var_x = (weights * (x_coords - center_x).pow(2)).sum(dim=(2, 3), keepdim=True) / denom
+        var_y = (weights * (y_coords - center_y).pow(2)).sum(dim=(2, 3), keepdim=True) / denom
+        spread_x = var_x.clamp(min=1e-12).sqrt() * has_mask
+        spread_y = var_y.clamp(min=1e-12).sqrt() * has_mask
 
         context_area = torch.clamp(context_mask, 0.0, 1.0).mean(dim=(2, 3), keepdim=True)
         geometry = torch.cat(
