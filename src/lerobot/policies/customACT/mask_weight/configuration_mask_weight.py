@@ -28,7 +28,8 @@ class MaskWeightConfig:
     mask_geometry_token_gate_init: float = 0.2
 
     # V4.7 object-weighted mask. This does not add ACT encoder tokens; it learns
-    # which YOLO instances should contribute to the mask that feeds the v4.2 path.
+    # which YOLO instances should enhance the mask while the union mask remains
+    # the stable base for dense guidance.
     use_object_weighted_mask: bool = True
     max_object_weight_instances: int = 8
     object_weight_embed_dim: int = 64
@@ -36,7 +37,7 @@ class MaskWeightConfig:
     object_weight_relation_layers: int = 1
     object_weight_attention_heads: int = 4
     object_weight_init: float = 0.9
-    object_weight_union_floor: float = 0.25
+    object_weight_union_floor: float = 0.7
     num_yolo_classes: int | None = None
 
     # YOLO mask post-processing.

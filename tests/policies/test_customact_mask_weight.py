@@ -45,7 +45,7 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.object_weight_relation_layers == 1
     assert config.object_weight_attention_heads == 4
     assert config.object_weight_init == pytest.approx(0.9)
-    assert config.object_weight_union_floor == pytest.approx(0.25)
+    assert config.object_weight_union_floor == pytest.approx(0.7)
     assert config.num_yolo_classes is None
 
 
@@ -338,6 +338,59 @@ def test_object_weighted_mask_preserves_v42_token_count_and_gets_gradients():
     assert adapter.object_weight_net.class_embed.weight.grad is not None
     assert torch.isfinite(adapter.object_weight_net.output[-1].weight.grad).all()
     assert torch.isfinite(adapter.object_weight_net.class_embed.weight.grad).all()
+
+
+def test_object_weighted_mask_uses_base_mask_for_guidance_and_object_mask_for_tokens():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        num_yolo_classes=4,
+        max_object_weight_instances=1,
+        object_weight_embed_dim=4,
+        object_weight_hidden_dim=8,
+        object_weight_attention_heads=2,
+        object_weight_union_floor=0.7,
+        use_target_token_attention=False,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+    with torch.no_grad():
+        adapter.object_weight_net.output[-1].weight.zero_()
+        adapter.object_weight_net.output[-1].bias.fill_(torch.logit(torch.tensor(0.1)).item())
+
+    features = torch.randn(2, 8, 5, 6)
+    instance_masks = torch.zeros(2, 1, 1, 5, 6)
+    instance_masks[:, 0, :, 1:4, 2:5] = 1.0
+    union_mask = instance_masks.amax(dim=1)
+    object_inputs = {
+        "instance_masks": instance_masks,
+        "class_ids": torch.ones(2, 1, dtype=torch.long),
+        "confidences": torch.full((2, 1), 0.9),
+        "valid": torch.ones(2, 1),
+    }
+
+    _, target_tokens, _, _, _ = adapter(features, union_mask, object_weight_inputs=object_inputs)
+
+    union_mean = union_mask.mean().item()
+    expected_object_mean = 0.1 * union_mean
+    expected_base_mean = 0.7 * union_mean
+    assert target_tokens.shape == (2, 2, 8)
+    assert adapter.latest_debug["object_weight_mean"] == pytest.approx(0.1, abs=1e-5)
+    assert adapter.latest_debug["object_weight_weighted_mask_mean"] == pytest.approx(expected_object_mean, abs=1e-5)
+    assert adapter.latest_debug["object_weight_object_token_mask_mean"] == pytest.approx(
+        expected_object_mean,
+        abs=1e-5,
+    )
+    assert adapter.latest_debug["object_weight_final_mask_mean"] == pytest.approx(expected_base_mean, abs=1e-5)
+    assert adapter.latest_debug["object_weight_base_mask_mean"] == pytest.approx(expected_base_mean, abs=1e-5)
+    assert adapter.latest_debug["target_mask_mean"] == pytest.approx(expected_base_mean, abs=1e-5)
+    assert adapter.latest_debug["object_token_target_mask_mean"] == pytest.approx(expected_object_mean, abs=1e-5)
+    assert adapter.latest_object_weighted_mask.mean().item() == pytest.approx(expected_base_mean, abs=1e-5)
+    assert adapter.latest_target_token_debug["target_mask"].mean().item() == pytest.approx(
+        expected_object_mean,
+        abs=1e-5,
+    )
 
 
 def test_object_weighted_mask_padding_slots_have_finite_gradients():
