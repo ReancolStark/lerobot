@@ -525,6 +525,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self.latest_mask_geometry_debug: dict[str, torch.Tensor | None] = {}
         self.latest_object_weight_debug: dict[str, torch.Tensor | None] = {}
         self.latest_object_weighted_mask: torch.Tensor | None = None
+        self.latest_object_token_mask: torch.Tensor | None = None
 
         hidden_dim = int(config.adapter_hidden_dim)
         if config.use_spatial_embedding:
@@ -856,6 +857,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         object_weight_inputs: dict[str, torch.Tensor] | None,
     ) -> torch.Tensor:
         self.latest_object_weighted_mask = union_mask
+        self.latest_object_token_mask = union_mask
         if self.object_weight_net is None:
             self.latest_object_weight_debug = {}
             return union_mask
@@ -880,8 +882,9 @@ class MaskGuidedVisualAdapter(nn.Module):
             1.0,
         )
         floor_mask = torch.clamp(union_mask * float(self.config.object_weight_union_floor), 0.0, 1.0)
-        final_mask = torch.maximum(floor_mask, weighted_mask)
-        self.latest_object_weighted_mask = final_mask
+        base_mask = torch.maximum(floor_mask, weighted_mask)
+        self.latest_object_weighted_mask = base_mask
+        self.latest_object_token_mask = weighted_mask
         self.latest_object_weight_debug = {
             "weights": object_weights.detach(),
             "valid": valid.detach(),
@@ -889,9 +892,11 @@ class MaskGuidedVisualAdapter(nn.Module):
             "confidences": confidences.detach(),
             "union_mask": union_mask.detach(),
             "weighted_mask": weighted_mask.detach(),
-            "final_mask": final_mask.detach(),
+            "final_mask": base_mask.detach(),
+            "base_mask": base_mask.detach(),
+            "object_token_mask": weighted_mask.detach(),
         }
-        return final_mask
+        return base_mask
 
     def _compute_reliability(self, target_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         confidence_score = target_mask.amax(dim=(2, 3), keepdim=True)
@@ -919,10 +924,11 @@ class MaskGuidedVisualAdapter(nn.Module):
     def _build_guidance(
         self,
         mask: torch.Tensor,
+        apply_stochastic: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_mask = torch.clamp(mask, 0.0, 1.0)
 
-        if self.training and self.config.mask_dropout_p > 0:
+        if apply_stochastic and self.training and self.config.mask_dropout_p > 0:
             keep = torch.rand(
                 target_mask.shape[0],
                 1,
@@ -934,7 +940,17 @@ class MaskGuidedVisualAdapter(nn.Module):
             keep = (keep >= float(self.config.mask_dropout_p)).to(dtype=target_mask.dtype)
             target_mask = target_mask * keep
 
-        target_mask, mask_noise_applied = self._apply_mask_noise(target_mask)
+        if apply_stochastic:
+            target_mask, mask_noise_applied = self._apply_mask_noise(target_mask)
+        else:
+            mask_noise_applied = torch.zeros(
+                target_mask.shape[0],
+                1,
+                1,
+                1,
+                dtype=target_mask.dtype,
+                device=target_mask.device,
+            )
         reliability, confidence_score, mask_area = self._compute_reliability(target_mask)
 
         dilation = max(0, int(self.config.context_dilation))
@@ -1201,6 +1217,10 @@ class MaskGuidedVisualAdapter(nn.Module):
     ]:
         mask = mask.to(dtype=visual_features.dtype, device=visual_features.device)
         mask = self._make_object_weighted_mask(visual_features, mask, object_weight_inputs)
+        object_token_mask = self.latest_object_token_mask
+        if object_token_mask is None:
+            object_token_mask = mask
+        object_token_mask = object_token_mask.to(dtype=visual_features.dtype, device=visual_features.device)
         (
             target_mask,
             context_mask,
@@ -1210,6 +1230,15 @@ class MaskGuidedVisualAdapter(nn.Module):
             mask_area,
             mask_noise_applied,
         ) = self._build_guidance(mask)
+        (
+            object_target_mask,
+            object_context_mask,
+            object_background_mask,
+            _object_confidence_map,
+            object_reliability,
+            _object_mask_area,
+            _object_mask_noise_applied,
+        ) = self._build_guidance(object_token_mask, apply_stochastic=False)
         guidance = torch.cat([target_mask, context_mask, background_mask, confidence_map], dim=1)
         reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
 
@@ -1238,10 +1267,10 @@ class MaskGuidedVisualAdapter(nn.Module):
         confidence_score = confidence_map.amax(dim=(2, 3), keepdim=True)
         target_tokens, target_pos_embed = self._make_target_tokens(
             guided_features,
-            target_mask,
-            context_mask,
-            background_mask,
-            reliability,
+            object_target_mask,
+            object_context_mask,
+            object_background_mask,
+            object_reliability,
             record_debug=record_debug,
         )
         mask_geometry_token, mask_geometry_pos_embed = self._make_mask_geometry_token(
@@ -1317,6 +1346,8 @@ class MaskGuidedVisualAdapter(nn.Module):
             object_union_mask = object_weight_debug.get("union_mask")
             object_weighted_mask = object_weight_debug.get("weighted_mask")
             object_final_mask = object_weight_debug.get("final_mask")
+            object_base_mask = object_weight_debug.get("base_mask")
+            object_token_mask_debug = object_weight_debug.get("object_token_mask")
             if isinstance(object_weights, torch.Tensor) and isinstance(object_valid, torch.Tensor):
                 valid_float = object_valid.detach().float()
                 valid_sum = valid_float.sum()
@@ -1373,6 +1404,16 @@ class MaskGuidedVisualAdapter(nn.Module):
                 if object_final_mask is None
                 else object_final_mask.detach().float().mean()
             )
+            base_mask_mean = (
+                torch.zeros((), device=visual_features.device)
+                if object_base_mask is None
+                else object_base_mask.detach().float().mean()
+            )
+            object_token_mask_mean = (
+                torch.zeros((), device=visual_features.device)
+                if object_token_mask_debug is None
+                else object_token_mask_debug.detach().float().mean()
+            )
             mask_geometry_debug = self.latest_mask_geometry_debug
             mask_geometry_values = mask_geometry_debug.get("geometry")
             mask_geometry_token_debug = mask_geometry_debug.get("geometry_token")
@@ -1402,6 +1443,8 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "object_weight_std": float(object_weight_std.item()),
                 "object_weight_valid_count": float(object_weight_valid_count.item()),
                 "object_weight_final_mask_mean": float(final_mask_mean.item()),
+                "object_weight_base_mask_mean": float(base_mask_mean.item()),
+                "object_weight_object_token_mask_mean": float(object_token_mask_mean.item()),
                 "object_weight_union_mask_mean": float(union_mask_mean.item()),
                 "object_weight_weighted_mask_mean": float(weighted_mask_mean.item()),
                 "object_weight_floor": float(self.config.object_weight_union_floor),
@@ -1424,6 +1467,10 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "target_mask_mean": float(target_mask.detach().float().mean().item()),
                 "context_mask_mean": float(context_mask.detach().float().mean().item()),
                 "background_mask_mean": float(background_mask.detach().float().mean().item()),
+                "object_token_target_mask_mean": float(object_target_mask.detach().float().mean().item()),
+                "object_token_context_mask_mean": float(object_context_mask.detach().float().mean().item()),
+                "object_token_background_mask_mean": float(object_background_mask.detach().float().mean().item()),
+                "object_token_reliability_mean": float(object_reliability.detach().float().mean().item()),
                 "mask_area_mean": float(mask_area.detach().float().mean().item()),
                 "reliability_mean": float(reliability.detach().float().mean().item()),
                 "reliability_min": float(reliability.detach().float().min().item()),
