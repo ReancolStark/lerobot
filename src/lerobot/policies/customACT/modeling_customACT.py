@@ -353,8 +353,18 @@ class ACTPolicy(PreTrainedPolicy):
             if not isinstance(data, dict):
                 continue
             target_tokens = data.get("target_tokens")
-            target_feature = data.get("target_feature")
-            background_feature = data.get("background_feature")
+            object_target_feature = data.get("object_target_feature")
+            object_background_feature = data.get("object_background_feature")
+            target_feature = (
+                object_target_feature
+                if isinstance(object_target_feature, Tensor)
+                else data.get("target_feature")
+            )
+            background_feature = (
+                object_background_feature
+                if isinstance(object_background_feature, Tensor)
+                else data.get("background_feature")
+            )
             if (
                 not isinstance(target_tokens, Tensor)
                 or not isinstance(target_feature, Tensor)
@@ -426,8 +436,14 @@ class ACTPolicy(PreTrainedPolicy):
         def _add_loss(current: Tensor | None, term: Tensor) -> Tensor:
             return term if current is None else current + term
 
+        def _normalized_l1_loss(values: Tensor, target: Tensor) -> Tensor:
+            values_norm = F.normalize(values, dim=-1, eps=1e-6)
+            target_norm = F.normalize(target, dim=-1, eps=1e-6)
+            return F.l1_loss(values_norm, target_norm)
+
         if feature_weight > 0.0:
             feature_losses = []
+            raw_feature_losses = []
             for img_key, ref_data in reference.items():
                 aug_data = augmented.get(img_key, {})
                 ref_feature = ref_data.get("target_feature") if isinstance(ref_data, dict) else None
@@ -437,13 +453,16 @@ class ACTPolicy(PreTrainedPolicy):
                     and isinstance(aug_feature, Tensor)
                     and ref_feature.shape == aug_feature.shape
                 ):
-                    feature_losses.append(F.l1_loss(aug_feature, ref_feature.detach()))
+                    raw_feature_losses.append(F.l1_loss(aug_feature, ref_feature.detach()))
+                    feature_losses.append(_normalized_l1_loss(aug_feature, ref_feature.detach()))
 
             if feature_losses:
                 feature_loss = torch.stack(feature_losses).mean()
                 total_loss = _add_loss(total_loss, feature_loss * feature_weight)
                 if record_debug:
+                    raw_feature_loss = torch.stack(raw_feature_losses).mean()
                     debug["mask_weight/consistency/feature_loss"] = float(feature_loss.detach().item())
+                    debug["mask_weight/consistency/feature_raw_l1"] = float(raw_feature_loss.detach().item())
                     debug["mask_weight/consistency/feature_weight"] = feature_weight
                     debug["mask_weight/consistency/feature_weighted_loss"] = float(
                         (feature_loss.detach() * feature_weight).item()
@@ -455,6 +474,7 @@ class ACTPolicy(PreTrainedPolicy):
 
         if token_weight > 0.0:
             token_losses = []
+            raw_token_losses = []
             for img_key, ref_data in reference.items():
                 aug_data = augmented.get(img_key, {})
                 ref_tokens = ref_data.get("target_tokens") if isinstance(ref_data, dict) else None
@@ -464,13 +484,16 @@ class ACTPolicy(PreTrainedPolicy):
                     and isinstance(aug_tokens, Tensor)
                     and ref_tokens.shape == aug_tokens.shape
                 ):
-                    token_losses.append(F.l1_loss(aug_tokens, ref_tokens.detach()))
+                    raw_token_losses.append(F.l1_loss(aug_tokens, ref_tokens.detach()))
+                    token_losses.append(_normalized_l1_loss(aug_tokens, ref_tokens.detach()))
 
             if token_losses:
                 token_loss = torch.stack(token_losses).mean()
                 total_loss = _add_loss(total_loss, token_loss * token_weight)
                 if record_debug:
+                    raw_token_loss = torch.stack(raw_token_losses).mean()
                     debug["mask_weight/consistency/token_loss"] = float(token_loss.detach().item())
+                    debug["mask_weight/consistency/token_raw_l1"] = float(raw_token_loss.detach().item())
                     debug["mask_weight/consistency/token_weight"] = token_weight
                     debug["mask_weight/consistency/token_weighted_loss"] = float(
                         (token_loss.detach() * token_weight).item()

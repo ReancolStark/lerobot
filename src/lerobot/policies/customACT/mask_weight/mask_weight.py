@@ -728,6 +728,90 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_mask = torch.where(apply_noise, noisy_mask, target_mask)
         return target_mask, apply_noise_float
 
+    def _apply_shared_mask_stochastic(
+        self,
+        base_mask: torch.Tensor,
+        object_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        noise_applied = torch.zeros(
+            base_mask.shape[0],
+            1,
+            1,
+            1,
+            dtype=base_mask.dtype,
+            device=base_mask.device,
+        )
+        if not self.training:
+            return base_mask, object_mask, noise_applied
+
+        batch_size = base_mask.shape[0]
+        if self.config.mask_dropout_p > 0:
+            keep = torch.rand(
+                batch_size,
+                1,
+                1,
+                1,
+                dtype=base_mask.dtype,
+                device=base_mask.device,
+            )
+            keep = (keep >= float(self.config.mask_dropout_p)).to(dtype=base_mask.dtype)
+            base_mask = base_mask * keep
+            object_mask = object_mask * keep
+
+        if self.config.mask_noise_p <= 0.0:
+            return base_mask, object_mask, noise_applied
+
+        apply_noise = (
+            torch.rand(batch_size, 1, 1, 1, dtype=base_mask.dtype, device=base_mask.device)
+            < float(self.config.mask_noise_p)
+        )
+        noisy_base_mask = base_mask
+        noisy_object_mask = object_mask
+
+        jitter_px = int(self.config.mask_noise_jitter_px)
+        if jitter_px > 0:
+            shifted_base_masks = []
+            shifted_object_masks = []
+            shifts = torch.randint(
+                -jitter_px,
+                jitter_px + 1,
+                (batch_size, 2),
+                device=base_mask.device,
+            )
+            for i in range(batch_size):
+                dx = int(shifts[i, 0].item())
+                dy = int(shifts[i, 1].item())
+                shifted_base_masks.append(self._shift_mask(noisy_base_mask[i : i + 1], dx=dx, dy=dy))
+                shifted_object_masks.append(self._shift_mask(noisy_object_mask[i : i + 1], dx=dx, dy=dy))
+            noisy_base_mask = torch.cat(shifted_base_masks, dim=0)
+            noisy_object_mask = torch.cat(shifted_object_masks, dim=0)
+
+        if self.config.mask_noise_confidence_min < 1.0:
+            min_scale = float(self.config.mask_noise_confidence_min)
+            scale = min_scale + torch.rand(
+                batch_size,
+                1,
+                1,
+                1,
+                dtype=base_mask.dtype,
+                device=base_mask.device,
+            ) * (1.0 - min_scale)
+            noisy_base_mask = noisy_base_mask * scale
+            noisy_object_mask = noisy_object_mask * scale
+
+        if self.config.mask_noise_dropout_p > 0.0:
+            keep_mask = (
+                torch.rand(batch_size, 1, 1, 1, dtype=base_mask.dtype, device=base_mask.device)
+                >= float(self.config.mask_noise_dropout_p)
+            ).to(dtype=base_mask.dtype)
+            noisy_base_mask = noisy_base_mask * keep_mask
+            noisy_object_mask = noisy_object_mask * keep_mask
+
+        base_mask = torch.where(apply_noise, noisy_base_mask, base_mask)
+        object_mask = torch.where(apply_noise, noisy_object_mask, object_mask)
+        noise_applied = apply_noise.to(dtype=base_mask.dtype)
+        return base_mask, object_mask, noise_applied
+
     def _prepare_object_weight_inputs(
         self,
         object_weight_inputs: dict[str, torch.Tensor] | None,
@@ -925,6 +1009,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         self,
         mask: torch.Tensor,
         apply_stochastic: bool = True,
+        mask_noise_applied: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         target_mask = torch.clamp(mask, 0.0, 1.0)
 
@@ -942,7 +1027,7 @@ class MaskGuidedVisualAdapter(nn.Module):
 
         if apply_stochastic:
             target_mask, mask_noise_applied = self._apply_mask_noise(target_mask)
-        else:
+        elif mask_noise_applied is None:
             mask_noise_applied = torch.zeros(
                 target_mask.shape[0],
                 1,
@@ -1140,11 +1225,17 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_mask: torch.Tensor,
         background_mask: torch.Tensor,
         target_tokens: torch.Tensor | None,
+        object_target_mask: torch.Tensor | None = None,
+        object_background_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         data = {
             "target_feature": self._masked_pool(guided_features, target_mask),
             "background_feature": self._masked_pool(guided_features, background_mask),
         }
+        if object_target_mask is not None:
+            data["object_target_feature"] = self._masked_pool(guided_features, object_target_mask)
+        if object_background_mask is not None:
+            data["object_background_feature"] = self._masked_pool(guided_features, object_background_mask)
         if target_tokens is not None:
             data["target_tokens"] = target_tokens
         return data
@@ -1221,6 +1312,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         if object_token_mask is None:
             object_token_mask = mask
         object_token_mask = object_token_mask.to(dtype=visual_features.dtype, device=visual_features.device)
+        mask, object_token_mask, mask_noise_applied = self._apply_shared_mask_stochastic(mask, object_token_mask)
         (
             target_mask,
             context_mask,
@@ -1229,7 +1321,7 @@ class MaskGuidedVisualAdapter(nn.Module):
             reliability,
             mask_area,
             mask_noise_applied,
-        ) = self._build_guidance(mask)
+        ) = self._build_guidance(mask, apply_stochastic=False, mask_noise_applied=mask_noise_applied)
         (
             object_target_mask,
             object_context_mask,
@@ -1285,6 +1377,8 @@ class MaskGuidedVisualAdapter(nn.Module):
             target_mask,
             background_mask,
             target_tokens,
+            object_target_mask=object_target_mask,
+            object_background_mask=object_background_mask,
         )
         if not record_debug:
             self.latest_debug = {}

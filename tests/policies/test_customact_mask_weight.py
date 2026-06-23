@@ -393,6 +393,44 @@ def test_object_weighted_mask_uses_base_mask_for_guidance_and_object_mask_for_to
     )
 
 
+def test_object_weighted_mask_dropout_is_shared_between_base_and_object_tokens():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=1.0,
+        mask_noise_p=0.0,
+        num_yolo_classes=4,
+        max_object_weight_instances=1,
+        object_weight_embed_dim=4,
+        object_weight_hidden_dim=8,
+        object_weight_attention_heads=2,
+        use_target_token_attention=False,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+    adapter.train()
+
+    features = torch.randn(2, 8, 5, 6)
+    instance_masks = torch.zeros(2, 1, 1, 5, 6)
+    instance_masks[:, 0, :, 1:4, 2:5] = 1.0
+    union_mask = instance_masks.amax(dim=1)
+    object_inputs = {
+        "instance_masks": instance_masks,
+        "class_ids": torch.ones(2, 1, dtype=torch.long),
+        "confidences": torch.full((2, 1), 0.9),
+        "valid": torch.ones(2, 1),
+    }
+
+    _, target_tokens, _, mask_geometry_token, _ = adapter(features, union_mask, object_weight_inputs=object_inputs)
+
+    assert target_tokens.shape == (2, 2, 8)
+    assert torch.allclose(target_tokens, torch.zeros_like(target_tokens))
+    assert torch.allclose(mask_geometry_token, torch.zeros_like(mask_geometry_token))
+    assert adapter.latest_debug["target_mask_mean"] == pytest.approx(0.0)
+    assert adapter.latest_debug["object_token_target_mask_mean"] == pytest.approx(0.0)
+    assert adapter.latest_debug["reliability_mean"] == pytest.approx(0.0)
+    assert adapter.latest_debug["object_token_reliability_mean"] == pytest.approx(0.0)
+
+
 def test_object_weighted_mask_padding_slots_have_finite_gradients():
     torch.manual_seed(0)
     config = MaskWeightConfig(
@@ -584,6 +622,37 @@ def test_target_background_contrastive_loss_has_debug_metrics():
     assert debug["mask_weight/target_token/contrastive_pairs"] == pytest.approx(1.0)
     assert debug["mask_weight/target_token/contrastive_loss"] == pytest.approx(0.0)
     assert debug["mask_weight/target_token/target_cosine"] > debug["mask_weight/target_token/background_cosine"]
+
+
+def test_representation_consistency_uses_normalized_loss_with_raw_debug():
+    policy = ACTPolicy.__new__(ACTPolicy)
+    policy.config = SimpleNamespace(use_mask_weight=True, mw_config=MaskWeightConfig())
+    reference = {
+        "cam": {
+            "target_feature": torch.ones(2, 4),
+            "target_tokens": torch.ones(2, 2, 4),
+        }
+    }
+    augmented = {
+        "cam": {
+            "target_feature": torch.ones(2, 4) * 1000.0,
+            "target_tokens": torch.ones(2, 2, 4) * 1000.0,
+        }
+    }
+
+    loss, debug = policy._compute_mask_weight_representation_consistency(
+        reference,
+        augmented,
+        record_debug=True,
+    )
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    assert loss.item() == pytest.approx(0.0)
+    assert debug["mask_weight/consistency/feature_loss"] == pytest.approx(0.0)
+    assert debug["mask_weight/consistency/token_loss"] == pytest.approx(0.0)
+    assert debug["mask_weight/consistency/feature_raw_l1"] > 900.0
+    assert debug["mask_weight/consistency/token_raw_l1"] > 900.0
 
 
 def test_mask_guided_background_augmentation_preserves_target_and_changes_background():
