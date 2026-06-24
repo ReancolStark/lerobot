@@ -967,8 +967,17 @@ class MaskGuidedVisualAdapter(nn.Module):
         )
         floor_mask = torch.clamp(union_mask * float(self.config.object_weight_union_floor), 0.0, 1.0)
         base_mask = torch.maximum(floor_mask, weighted_mask)
+        has_valid = (valid.sum(dim=1).view(-1, 1, 1, 1) > 0.0)
+        base_mask = torch.where(has_valid, base_mask, union_mask)
+        object_mix = float(self.config.object_token_mask_mix)
+        object_token_mask = torch.clamp(
+            base_mask * (1.0 - object_mix) + weighted_mask * object_mix,
+            0.0,
+            1.0,
+        )
+        object_token_mask = torch.where(has_valid, object_token_mask, union_mask)
         self.latest_object_weighted_mask = base_mask
-        self.latest_object_token_mask = weighted_mask
+        self.latest_object_token_mask = object_token_mask
         self.latest_object_weight_debug = {
             "weights": object_weights.detach(),
             "valid": valid.detach(),
@@ -978,7 +987,7 @@ class MaskGuidedVisualAdapter(nn.Module):
             "weighted_mask": weighted_mask.detach(),
             "final_mask": base_mask.detach(),
             "base_mask": base_mask.detach(),
-            "object_token_mask": weighted_mask.detach(),
+            "object_token_mask": object_token_mask.detach(),
         }
         return base_mask
 
@@ -1145,6 +1154,15 @@ class MaskGuidedVisualAdapter(nn.Module):
         ]
         return [torch.clamp(pool_masks[i] if i < len(pool_masks) else global_mask, 0.0, 1.0) for i in range(num_tokens)]
 
+    def _target_token_attention_gate(self) -> torch.Tensor | None:
+        if self.target_token_attention_scale is None:
+            return None
+        gate = torch.clamp(self.target_token_attention_scale, min=0.0)
+        gate_max = float(getattr(self.config, "target_token_attention_gate_max", 0.0))
+        if gate_max > 0.0:
+            gate = torch.clamp(gate, max=gate_max)
+        return gate
+
     def _apply_target_token_attention(
         self,
         features: torch.Tensor,
@@ -1154,9 +1172,9 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_mask: torch.Tensor,
         context_mask: torch.Tensor,
         record_debug: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         if self.target_object_perceiver is None:
-            return token_seed, None, None
+            return token_seed, None, None, None
 
         batch_size, channels, height, width = features.shape
         visual_tokens = features.flatten(2).permute(2, 0, 1)
@@ -1177,8 +1195,22 @@ class MaskGuidedVisualAdapter(nn.Module):
         attn_delta = refined_tokens - token_seed
         reliability_gate = reliability if self.use_reliability_gate else torch.ones_like(reliability)
         token_gate = reliability_gate.view(1, batch_size, 1)
-        attn_delta = self.target_token_attention_scale * token_gate * attn_delta
-        return token_seed + attn_delta, attn_delta, attn_weights
+        attention_gate = self._target_token_attention_gate()
+        if attention_gate is None:
+            return token_seed, None, attn_weights, None
+        attn_delta = attention_gate * token_gate * attn_delta
+
+        limiter_scale = torch.ones(1, batch_size, 1, dtype=features.dtype, device=features.device)
+        delta_ratio_limit = float(getattr(self.config, "target_token_delta_ratio_limit", 0.0))
+        if delta_ratio_limit > 0.0:
+            visual_rms = features.detach().float().pow(2).mean(dim=(1, 2, 3)).sqrt().clamp(min=1e-6)
+            delta_rms = attn_delta.detach().float().pow(2).mean(dim=(0, 2)).sqrt().clamp(min=1e-6)
+            limiter_scale = torch.clamp(
+                (visual_rms * delta_ratio_limit / delta_rms).view(1, batch_size, 1),
+                max=1.0,
+            ).to(dtype=features.dtype, device=features.device)
+            attn_delta = attn_delta * limiter_scale
+        return token_seed + attn_delta, attn_delta, attn_weights, limiter_scale
 
     def _make_target_tokens(
         self,
@@ -1200,7 +1232,7 @@ class MaskGuidedVisualAdapter(nn.Module):
         target_tokens = torch.stack(pooled_tokens, dim=0)
         target_tokens = target_tokens + self.target_token_proj(target_tokens)
 
-        target_tokens, attention_delta, attention_weights = self._apply_target_token_attention(
+        target_tokens, attention_delta, attention_weights, attention_limiter = self._apply_target_token_attention(
             features,
             target_tokens,
             token_masks,
@@ -1214,6 +1246,13 @@ class MaskGuidedVisualAdapter(nn.Module):
         self.latest_target_token_debug = {
             "attention_delta": attention_delta,
             "attention_weights": attention_weights,
+            "attention_gate": self._target_token_attention_gate().detach()
+            if self._target_token_attention_gate() is not None
+            else None,
+            "attention_gate_raw": self.target_token_attention_scale.detach()
+            if self.target_token_attention_scale is not None
+            else None,
+            "attention_limiter": attention_limiter.detach() if attention_limiter is not None else None,
             "target_mask": target_mask.detach(),
             "context_mask": context_mask.detach(),
         }
@@ -1442,6 +1481,9 @@ class MaskGuidedVisualAdapter(nn.Module):
             object_final_mask = object_weight_debug.get("final_mask")
             object_base_mask = object_weight_debug.get("base_mask")
             object_token_mask_debug = object_weight_debug.get("object_token_mask")
+            target_token_attention_gate = target_token_debug.get("attention_gate")
+            target_token_attention_gate_raw = target_token_debug.get("attention_gate_raw")
+            target_token_attention_limiter = target_token_debug.get("attention_limiter")
             if isinstance(object_weights, torch.Tensor) and isinstance(object_valid, torch.Tensor):
                 valid_float = object_valid.detach().float()
                 valid_sum = valid_float.sum()
@@ -1542,6 +1584,7 @@ class MaskGuidedVisualAdapter(nn.Module):
                 "object_weight_union_mask_mean": float(union_mask_mean.item()),
                 "object_weight_weighted_mask_mean": float(weighted_mask_mean.item()),
                 "object_weight_floor": float(self.config.object_weight_union_floor),
+                "object_weight_object_token_mix": float(self.config.object_token_mask_mix),
                 "object_weight_top_confidence": float(top_confidence.item()),
                 "object_weight_top_class": float(top_class.item()),
                 "object_weight_top_weight": float(top_weight.item()),
@@ -1595,12 +1638,30 @@ class MaskGuidedVisualAdapter(nn.Module):
                 self.latest_debug["region_attention_context_mean"] = float(region_attn_mean[1].item())
                 self.latest_debug["region_attention_background_mean"] = float(region_attn_mean[2].item())
             if self.target_token_attention_scale is not None:
+                gate_value = (
+                    self._target_token_attention_gate()
+                    if not isinstance(target_token_attention_gate, torch.Tensor)
+                    else target_token_attention_gate
+                )
                 self.latest_debug["target_token_attention_gate"] = float(
-                    self.target_token_attention_scale.detach().item()
+                    gate_value.detach().item()
                 )
                 self.latest_debug["object_perceiver_gate"] = float(
-                    self.target_token_attention_scale.detach().item()
+                    gate_value.detach().item()
                 )
+                self.latest_debug["target_token_attention_gate_raw"] = float(
+                    target_token_attention_gate_raw.detach().item()
+                    if isinstance(target_token_attention_gate_raw, torch.Tensor)
+                    else self.target_token_attention_scale.detach().item()
+                )
+                if isinstance(target_token_attention_limiter, torch.Tensor):
+                    limiter_float = target_token_attention_limiter.detach().float()
+                    self.latest_debug["target_token_delta_limiter_mean"] = float(
+                        limiter_float.mean().item()
+                    )
+                    self.latest_debug["target_token_delta_limiter_min"] = float(
+                        limiter_float.min().item()
+                    )
             target_token_attention_weights = target_token_debug.get("attention_weights")
             if isinstance(target_token_attention_weights, torch.Tensor):
                 attn_float = target_token_attention_weights.detach().float()

@@ -20,8 +20,10 @@ class MaskWeightConfig:
     use_target_token_attention: bool = True
     target_token_attention_heads: int = 4
     target_token_attention_dropout: float = 0.0
-    target_token_attention_gate_init: float = 0.2
-    target_token_mask_bias_scale: float = 2.0
+    target_token_attention_gate_init: float = 0.12
+    target_token_attention_gate_max: float = 0.2
+    target_token_delta_ratio_limit: float = 0.45
+    target_token_mask_bias_scale: float = 1.2
     target_object_perceiver_layers: int = 2
     target_object_perceiver_ffn_dim: int = 1024
     target_object_perceiver_dropout: float = 0.0
@@ -36,8 +38,9 @@ class MaskWeightConfig:
     object_weight_hidden_dim: int = 128
     object_weight_relation_layers: int = 1
     object_weight_attention_heads: int = 4
-    object_weight_init: float = 0.9
+    object_weight_init: float = 0.8
     object_weight_union_floor: float = 0.7
+    object_token_mask_mix: float = 0.2
     num_yolo_classes: int | None = None
 
     # YOLO mask post-processing.
@@ -73,8 +76,9 @@ class MaskWeightConfig:
     background_consistency_loss_weight: float = 0.1
     background_feature_consistency_loss_weight: float = 0.03
     background_token_consistency_loss_weight: float = 0.03
-    target_background_contrastive_loss_weight: float = 0.02
+    target_background_contrastive_loss_weight: float = 0.01
     target_background_contrastive_margin: float = 0.2
+    target_background_contrastive_use_object_features: bool = False
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05
     background_aug_mode: str = "mixed"  # "random_color", "noise", "mixed", or "shuffle".
@@ -99,6 +103,17 @@ class MaskWeightConfig:
             raise ValueError("target_token_attention_heads must be positive.")
         if not 0.0 <= self.target_token_attention_dropout <= 1.0:
             raise ValueError("target_token_attention_dropout must be in [0, 1].")
+        if self.target_token_attention_gate_init < 0.0:
+            raise ValueError("target_token_attention_gate_init must be non-negative.")
+        if self.target_token_attention_gate_max < 0.0:
+            raise ValueError("target_token_attention_gate_max must be non-negative.")
+        if (
+            self.target_token_attention_gate_max > 0.0
+            and self.target_token_attention_gate_init > self.target_token_attention_gate_max
+        ):
+            raise ValueError("target_token_attention_gate_init must be <= target_token_attention_gate_max.")
+        if self.target_token_delta_ratio_limit < 0.0:
+            raise ValueError("target_token_delta_ratio_limit must be non-negative.")
         if self.target_token_mask_bias_scale < 0.0:
             raise ValueError("target_token_mask_bias_scale must be non-negative.")
         if self.target_object_perceiver_layers <= 0:
@@ -189,5 +204,7 @@ class MaskWeightConfig:
             raise ValueError("object_weight_init must be in (0, 1).")
         if not 0.0 <= self.object_weight_union_floor <= 1.0:
             raise ValueError("object_weight_union_floor must be in [0, 1].")
+        if not 0.0 <= self.object_token_mask_mix <= 1.0:
+            raise ValueError("object_token_mask_mix must be in [0, 1].")
         if self.num_yolo_classes is not None and self.num_yolo_classes <= 0:
             raise ValueError("num_yolo_classes must be positive or None.")

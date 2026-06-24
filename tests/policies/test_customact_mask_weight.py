@@ -30,22 +30,26 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.background_token_consistency_loss_weight == pytest.approx(0.03)
     assert config.use_target_token_attention is True
     assert config.target_token_attention_heads == 4
-    assert config.target_token_attention_gate_init == pytest.approx(0.2)
-    assert config.target_token_mask_bias_scale == pytest.approx(2.0)
+    assert config.target_token_attention_gate_init == pytest.approx(0.12)
+    assert config.target_token_attention_gate_max == pytest.approx(0.2)
+    assert config.target_token_delta_ratio_limit == pytest.approx(0.45)
+    assert config.target_token_mask_bias_scale == pytest.approx(1.2)
     assert config.target_object_perceiver_layers == 2
     assert config.target_object_perceiver_ffn_dim == 1024
     assert config.target_object_perceiver_dropout == pytest.approx(0.0)
     assert config.mask_geometry_token_gate_init == pytest.approx(0.2)
-    assert config.target_background_contrastive_loss_weight == pytest.approx(0.02)
+    assert config.target_background_contrastive_loss_weight == pytest.approx(0.01)
     assert config.target_background_contrastive_margin == pytest.approx(0.2)
+    assert config.target_background_contrastive_use_object_features is False
     assert config.use_object_weighted_mask is True
     assert config.max_object_weight_instances == 8
     assert config.object_weight_embed_dim == 64
     assert config.object_weight_hidden_dim == 128
     assert config.object_weight_relation_layers == 1
     assert config.object_weight_attention_heads == 4
-    assert config.object_weight_init == pytest.approx(0.9)
+    assert config.object_weight_init == pytest.approx(0.8)
     assert config.object_weight_union_floor == pytest.approx(0.7)
+    assert config.object_token_mask_mix == pytest.approx(0.2)
     assert config.num_yolo_classes is None
 
 
@@ -143,6 +147,37 @@ def test_mask_guided_visual_adapter_target_tokens():
     assert adapter.target_object_perceiver[0].cross_attn.in_proj_weight.grad is not None
 
 
+def test_target_token_attention_gate_and_delta_are_bounded():
+    torch.manual_seed(0)
+    config = MaskWeightConfig(
+        adapter_hidden_dim=4,
+        mask_dropout_p=0.0,
+        mask_noise_p=0.0,
+        use_target_tokens=True,
+        target_token_attention_gate_init=0.2,
+        target_token_attention_gate_max=0.2,
+        target_token_delta_ratio_limit=0.05,
+    )
+    adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
+    with torch.no_grad():
+        adapter.target_token_attention_scale.fill_(1.0)
+
+    features = torch.randn(2, 8, 5, 6)
+    mask = torch.zeros(2, 1, 5, 6)
+    mask[:, :, 1:4, 2:5] = 1.0
+
+    _, target_tokens, _, _, _ = adapter(features, mask)
+
+    assert target_tokens.shape == (2, 2, 8)
+    assert adapter.latest_debug["target_token_attention_gate"] == pytest.approx(0.2)
+    assert adapter.latest_debug["object_perceiver_gate"] == pytest.approx(0.2)
+    assert adapter.latest_debug["target_token_attention_gate_raw"] == pytest.approx(1.0)
+    assert adapter.latest_debug["target_token_attention_delta_ratio"] <= 0.05 + 1e-6
+    assert adapter.latest_debug["object_perceiver_delta_ratio"] <= 0.05 + 1e-6
+    assert 0.0 <= adapter.latest_debug["target_token_delta_limiter_min"] <= 1.0
+    assert 0.0 <= adapter.latest_debug["target_token_delta_limiter_mean"] <= 1.0
+
+
 def test_mask_weight_config_rejects_invalid_background_strength():
     with pytest.raises(ValueError):
         MaskWeightConfig(background_aug_min_strength=0.9, background_aug_max_strength=0.2)
@@ -164,6 +199,14 @@ def test_mask_weight_config_rejects_invalid_v4_params():
         MaskWeightConfig(target_token_attention_heads=0)
     with pytest.raises(ValueError):
         MaskWeightConfig(target_token_attention_dropout=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_token_attention_gate_init=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_token_attention_gate_max=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_token_attention_gate_init=0.3, target_token_attention_gate_max=0.2)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(target_token_delta_ratio_limit=-0.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(target_token_mask_bias_scale=-0.1)
     with pytest.raises(ValueError):
@@ -190,6 +233,10 @@ def test_mask_weight_config_rejects_invalid_v4_params():
         MaskWeightConfig(object_weight_init=1.0)
     with pytest.raises(ValueError):
         MaskWeightConfig(object_weight_union_floor=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_token_mask_mix=-0.1)
+    with pytest.raises(ValueError):
+        MaskWeightConfig(object_token_mask_mix=1.1)
     with pytest.raises(ValueError):
         MaskWeightConfig(num_yolo_classes=0)
     with pytest.raises(ValueError):
@@ -340,7 +387,7 @@ def test_object_weighted_mask_preserves_v42_token_count_and_gets_gradients():
     assert torch.isfinite(adapter.object_weight_net.class_embed.weight.grad).all()
 
 
-def test_object_weighted_mask_uses_base_mask_for_guidance_and_object_mask_for_tokens():
+def test_object_weighted_mask_uses_base_first_blend_for_tokens():
     torch.manual_seed(0)
     config = MaskWeightConfig(
         adapter_hidden_dim=4,
@@ -352,6 +399,7 @@ def test_object_weighted_mask_uses_base_mask_for_guidance_and_object_mask_for_to
         object_weight_hidden_dim=8,
         object_weight_attention_heads=2,
         object_weight_union_floor=0.7,
+        object_token_mask_mix=0.2,
         use_target_token_attention=False,
     )
     adapter = MaskGuidedVisualAdapter(dim_model=8, config=config)
@@ -375,20 +423,25 @@ def test_object_weighted_mask_uses_base_mask_for_guidance_and_object_mask_for_to
     union_mean = union_mask.mean().item()
     expected_object_mean = 0.1 * union_mean
     expected_base_mean = 0.7 * union_mean
+    expected_object_token_mean = 0.8 * expected_base_mean + 0.2 * expected_object_mean
     assert target_tokens.shape == (2, 2, 8)
     assert adapter.latest_debug["object_weight_mean"] == pytest.approx(0.1, abs=1e-5)
     assert adapter.latest_debug["object_weight_weighted_mask_mean"] == pytest.approx(expected_object_mean, abs=1e-5)
     assert adapter.latest_debug["object_weight_object_token_mask_mean"] == pytest.approx(
-        expected_object_mean,
+        expected_object_token_mean,
         abs=1e-5,
     )
     assert adapter.latest_debug["object_weight_final_mask_mean"] == pytest.approx(expected_base_mean, abs=1e-5)
     assert adapter.latest_debug["object_weight_base_mask_mean"] == pytest.approx(expected_base_mean, abs=1e-5)
+    assert adapter.latest_debug["object_weight_object_token_mix"] == pytest.approx(0.2)
     assert adapter.latest_debug["target_mask_mean"] == pytest.approx(expected_base_mean, abs=1e-5)
-    assert adapter.latest_debug["object_token_target_mask_mean"] == pytest.approx(expected_object_mean, abs=1e-5)
+    assert adapter.latest_debug["object_token_target_mask_mean"] == pytest.approx(
+        expected_object_token_mean,
+        abs=1e-5,
+    )
     assert adapter.latest_object_weighted_mask.mean().item() == pytest.approx(expected_base_mean, abs=1e-5)
     assert adapter.latest_target_token_debug["target_mask"].mean().item() == pytest.approx(
-        expected_object_mean,
+        expected_object_token_mean,
         abs=1e-5,
     )
 

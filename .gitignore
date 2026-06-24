@@ -183,6 +183,7 @@ outputs/
 runs/
 datasets/
 *.pt
+mask_weight_handoff.md
 
 # 忽略一些配置笔记
 custom/notes/本地指令总结.md

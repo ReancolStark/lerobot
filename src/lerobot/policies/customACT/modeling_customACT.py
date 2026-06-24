@@ -349,6 +349,9 @@ class ACTPolicy(PreTrainedPolicy):
         losses = []
         target_cosines = []
         background_cosines = []
+        use_object_features = bool(
+            getattr(mw_config, "target_background_contrastive_use_object_features", False)
+        )
         for data in consistency.values():
             if not isinstance(data, dict):
                 continue
@@ -357,12 +360,12 @@ class ACTPolicy(PreTrainedPolicy):
             object_background_feature = data.get("object_background_feature")
             target_feature = (
                 object_target_feature
-                if isinstance(object_target_feature, Tensor)
+                if use_object_features and isinstance(object_target_feature, Tensor)
                 else data.get("target_feature")
             )
             background_feature = (
                 object_background_feature
-                if isinstance(object_background_feature, Tensor)
+                if use_object_features and isinstance(object_background_feature, Tensor)
                 else data.get("background_feature")
             )
             if (
@@ -402,6 +405,7 @@ class ACTPolicy(PreTrainedPolicy):
             "mask_weight/target_token/contrastive_weight": weight,
             "mask_weight/target_token/contrastive_weighted_loss": float(weighted_loss.detach().item()),
             "mask_weight/target_token/contrastive_margin": margin,
+            "mask_weight/target_token/contrastive_use_object_features": float(use_object_features),
             "mask_weight/target_token/contrastive_pairs": float(len(losses)),
             "mask_weight/target_token/target_cosine": float(torch.stack(target_cosines).mean().item()),
             "mask_weight/target_token/background_cosine": float(torch.stack(background_cosines).mean().item()),
