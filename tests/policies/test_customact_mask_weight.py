@@ -11,7 +11,7 @@ from lerobot.policies.customACT.mask_weight.mask_weight import (
 )
 
 
-def test_mask_weight_config_v4_direct_defaults():
+def test_mask_weight_config_v5_direct_defaults():
     config = MaskWeightConfig()
 
     assert config.use_residual_gate is False
@@ -35,7 +35,7 @@ def test_mask_weight_config_v4_direct_defaults():
     assert config.target_object_perceiver_ffn_dim == 1024
     assert config.target_object_perceiver_dropout == pytest.approx(0.0)
     assert config.mask_geometry_token_gate_init == pytest.approx(0.2)
-    assert config.target_background_contrastive_loss_weight == pytest.approx(0.02)
+    assert config.target_background_contrastive_loss_weight == pytest.approx(0.0)
     assert config.target_background_contrastive_margin == pytest.approx(0.2)
 
 
@@ -293,7 +293,10 @@ def test_target_token_attention_does_not_inject_empty_mask():
 def test_target_background_contrastive_loss_has_debug_metrics():
     policy = ACTPolicy.__new__(ACTPolicy)
     policy.training = True
-    policy.config = SimpleNamespace(use_mask_weight=True, mw_config=MaskWeightConfig())
+    policy.config = SimpleNamespace(
+        use_mask_weight=True,
+        mw_config=MaskWeightConfig(target_background_contrastive_loss_weight=0.02),
+    )
     reference = {
         "cam": {
             "target_tokens": torch.ones(2, 2, 4),

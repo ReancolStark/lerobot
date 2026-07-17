@@ -60,7 +60,7 @@ class MaskWeightConfig:
     background_consistency_loss_weight: float = 0.1
     background_feature_consistency_loss_weight: float = 0.03
     background_token_consistency_loss_weight: float = 0.03
-    target_background_contrastive_loss_weight: float = 0.02
+    target_background_contrastive_loss_weight: float = 0.0
     target_background_contrastive_margin: float = 0.2
     background_aug_context_dilation: int = 21
     background_aug_keep_threshold: float = 0.05
